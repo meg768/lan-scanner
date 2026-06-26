@@ -29,6 +29,18 @@ mkdir -p "${MACOS_DIR}" "${RESOURCES_DIR}"
 
 cp "${BUILD_DIR}/${EXECUTABLE_NAME}" "${MACOS_DIR}/${EXECUTABLE_NAME}"
 cp "${ROOT_DIR}/Resources/Info.plist" "${CONTENTS_DIR}/Info.plist"
+if [[ -f "${ROOT_DIR}/Resources/LANScannerIcon.icns" ]]; then
+  cp "${ROOT_DIR}/Resources/LANScannerIcon.icns" "${RESOURCES_DIR}/LANScannerIcon.icns"
+fi
+if [[ -f "${ROOT_DIR}/Resources/LANScannerIcon.svg" ]]; then
+  cp "${ROOT_DIR}/Resources/LANScannerIcon.svg" "${RESOURCES_DIR}/LANScannerIcon.svg"
+fi
+if [[ -f "${ROOT_DIR}/Resources/GhostIcon.icns" ]]; then
+  cp "${ROOT_DIR}/Resources/GhostIcon.icns" "${RESOURCES_DIR}/GhostIcon.icns"
+fi
+if [[ -f "${ROOT_DIR}/Resources/GhostIcon.svg" ]]; then
+  cp "${ROOT_DIR}/Resources/GhostIcon.svg" "${RESOURCES_DIR}/GhostIcon.svg"
+fi
 chmod +x "${MACOS_DIR}/${EXECUTABLE_NAME}"
 
 echo "Built ${APP_DIR}"

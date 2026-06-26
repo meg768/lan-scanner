@@ -8,6 +8,8 @@
 	<string>LANScanner</string>
 	<key>CFBundleIdentifier</key>
 	<string>se.meg768.lan-scanner</string>
+	<key>CFBundleIconFile</key>
+	<string>GhostIcon</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
@@ -17,7 +19,7 @@
 	<key>CFBundleShortVersionString</key>
 	<string>0.1.0</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>2</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
 	<key>NSHumanReadableCopyright</key>

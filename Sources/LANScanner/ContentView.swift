@@ -190,8 +190,9 @@ struct HeaderPanel: View {
             Spacer()
 
             HStack(spacing: 8) {
-                Image(systemName: "network")
+                Image(systemName: "dot.radiowaves.left.and.right")
                     .font(.system(size: 30, weight: .bold))
+                    .foregroundStyle(AppColors.primaryStrong)
                 HStack(alignment: .firstTextBaseline, spacing: 5) {
                     Text("LAN")
                         .font(.system(size: 28, weight: .bold))
