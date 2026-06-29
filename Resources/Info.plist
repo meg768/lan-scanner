@@ -9,7 +9,7 @@
 	<key>CFBundleIdentifier</key>
 	<string>se.meg768.lan-scanner</string>
 	<key>CFBundleIconFile</key>
-	<string>GhostIcon</string>
+	<string>LANScannerIcon</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>

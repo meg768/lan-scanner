@@ -6,49 +6,54 @@ struct ContentView: View {
     @EnvironmentObject private var appearance: AppearanceSettings
     @StateObject private var store = ScannerStore()
     @State private var searchText = ""
-    @State private var devicePanelWidth: CGFloat?
+    @State private var sortColumn: DeviceSortColumn = .ipAddress
+    @State private var sortAscending = true
 
     var body: some View {
-        VStack(spacing: 12) {
+        VStack(spacing: 8) {
             HeaderPanel(
                 network: store.localNetwork,
                 isScanning: store.isScanning,
-                onScan: store.scan
+                isScanDisabled: store.isBusy,
+                isResetDisabled: store.isBusy || store.devices.isEmpty,
+                onScan: store.scan,
+                onReset: store.resetDevices
             )
 
-            ScannerSplitView(
+            DeviceListPanel(
                 devices: filteredDevices,
-                selectedDevice: store.selectedDevice,
-                isScanningServices: store.isScanningSelectedServices,
-                devicePanelWidth: $devicePanelWidth,
-                onSelect: store.selectDevice
+                sortColumn: $sortColumn,
+                sortAscending: $sortAscending
             )
 
             StatusBar(status: store.status, deviceCount: store.devices.count)
         }
         .id("\(appearance.mode.rawValue)-\(appearance.surface.rawValue)")
-        .padding(12)
-        .frame(minWidth: 980, minHeight: 640)
+        .padding(8)
+        .frame(minWidth: 1100, minHeight: 660)
         .background(AppColors.pageBackground)
+        .searchable(text: $searchText, placement: .toolbar, prompt: "Filter devices")
         .toolbar {
             ToolbarItemGroup {
+                Button {
+                    appearance.cycleSurface()
+                } label: {
+                    Label("Theme", systemImage: "slider.horizontal.3")
+                }
+
                 Button {
                     store.scan()
                 } label: {
                     Label("Scan", systemImage: "dot.radiowaves.left.and.right")
                 }
-                .disabled(store.isScanning)
+                .disabled(store.isBusy)
 
                 Button {
-                    searchText = ""
+                    store.resetDevices()
                 } label: {
-                    Label("Reset", systemImage: "arrow.counterclockwise")
+                    Label("Clear", systemImage: "trash")
                 }
-            }
-
-            ToolbarItem {
-                FilterField(text: $searchText)
-                    .frame(width: 260)
+                .disabled(store.devices.isEmpty)
             }
         }
         .onAppear {
@@ -63,7 +68,7 @@ struct ContentView: View {
     }
 
     private var filteredDevices: [NetworkDevice] {
-        store.devices.filter { device in
+        let filtered = store.devices.filter { device in
             guard !searchText.isEmpty else {
                 return true
             }
@@ -71,14 +76,79 @@ struct ContentView: View {
             let haystack = [
                 device.ipAddress,
                 device.hostname,
+                device.dnsName,
                 device.macAddress,
-                device.vendor,
-                device.services.map(\.name).joined(separator: " ")
+                device.vendor
             ]
                 .compactMap { $0 }
                 .joined(separator: " ")
 
             return haystack.localizedCaseInsensitiveContains(searchText)
+        }
+
+        return filtered.sorted { lhs, rhs in
+            DeviceSortComparator.compare(lhs, rhs, by: sortColumn, ascending: sortAscending)
+        }
+    }
+}
+
+enum DeviceSortColumn {
+    case name
+    case ipAddress
+    case macAddress
+    case vendor
+    case dnsName
+
+    var title: String {
+        switch self {
+        case .name:
+            return "Name"
+        case .ipAddress:
+            return "IP"
+        case .macAddress:
+            return "MAC"
+        case .vendor:
+            return "Vendor"
+        case .dnsName:
+            return "DNS Name"
+        }
+    }
+}
+
+enum DeviceSortComparator {
+    static func compare(_ lhs: NetworkDevice, _ rhs: NetworkDevice, by column: DeviceSortColumn, ascending: Bool) -> Bool {
+        let result: ComparisonResult
+
+        switch column {
+        case .name:
+            result = compareText(lhs.displayName, rhs.displayName)
+        case .ipAddress:
+            result = compareText(lhs.tableIPSortKey, rhs.tableIPSortKey)
+        case .macAddress:
+            result = compareText(lhs.tableMACAddress, rhs.tableMACAddress)
+        case .vendor:
+            result = compareText(lhs.tableVendor, rhs.tableVendor)
+        case .dnsName:
+            result = compareText(lhs.tableDNSName, rhs.tableDNSName)
+        }
+
+        if result == .orderedSame {
+            return lhs.tableIPSortKey < rhs.tableIPSortKey
+        }
+
+        return ascending ? result == .orderedAscending : result == .orderedDescending
+    }
+
+    private static func compareText(_ lhs: String, _ rhs: String) -> ComparisonResult {
+        switch (lhs.isEmpty, rhs.isEmpty) {
+        case (true, true):
+            return .orderedSame
+        case (true, false):
+            return .orderedDescending
+        case (false, true):
+            return .orderedAscending
+        case (false, false):
+            return lhs.localizedStandardCompare(rhs)
         }
     }
 }
@@ -86,24 +156,28 @@ struct ContentView: View {
 @MainActor
 final class ScannerStore: ObservableObject {
     @Published var devices: [NetworkDevice] = []
-    @Published var selectedDevice: NetworkDevice?
     @Published var localNetwork = LANScanner.localNetwork()
     @Published var status: ScanStatus = .idle
     @Published var isScanning = false
-    @Published var isScanningSelectedServices = false
+    @Published var isBusy = false
 
     private let scanner = LANScanner()
-    private var serviceScanTask: Task<Void, Never>?
 
     func refreshLocalNetwork() {
         localNetwork = LANScanner.localNetwork()
     }
 
+    func resetDevices() {
+        devices = []
+        status = .idle
+    }
+
     func scan() {
-        guard !isScanning else {
+        guard !isBusy else {
             return
         }
 
+        isBusy = true
         isScanning = true
         status = .scanning("Scanning local network...")
         refreshLocalNetwork()
@@ -116,428 +190,552 @@ final class ScannerStore: ObservableObject {
                     }
                 }
 
-                devices = foundDevices
-                selectedDevice = foundDevices.first
-
-                status = .complete("Found \(foundDevices.count) online devices.")
+                mergeDevices(foundDevices)
+                isScanning = false
+                status = .complete("Updated \(foundDevices.count) devices. \(devices.count) listed.")
+                isBusy = false
             } catch {
                 status = .failed(error.localizedDescription)
+                isScanning = false
+                isBusy = false
             }
-
-            isScanning = false
         }
     }
 
-    func selectDevice(_ device: NetworkDevice) {
-        selectedDevice = device
-        serviceScanTask?.cancel()
+    private func mergeDevices(_ incomingDevices: [NetworkDevice]) {
+        var merged = Dictionary(uniqueKeysWithValues: devices.map { ($0.ipAddress, $0) })
 
-        guard device.services.isEmpty else {
-            isScanningSelectedServices = false
-            return
+        for incomingDevice in incomingDevices {
+            if let currentDevice = merged[incomingDevice.ipAddress] {
+                merged[incomingDevice.ipAddress] = mergedDevice(currentDevice, with: incomingDevice)
+            } else {
+                merged[incomingDevice.ipAddress] = incomingDevice
+            }
         }
 
-        isScanningSelectedServices = true
-        serviceScanTask = Task {
-            let scannedDevice = await scanner.scanServices(for: device)
+        devices = merged.values.sorted { $0.tableIPSortKey < $1.tableIPSortKey }
+    }
 
-            guard !Task.isCancelled else {
-                return
-            }
-
-            if let index = devices.firstIndex(where: { $0.id == scannedDevice.id }) {
-                devices[index] = scannedDevice
-            }
-
-            if selectedDevice?.id == scannedDevice.id {
-                selectedDevice = scannedDevice
-            }
-
-            isScanningSelectedServices = false
-        }
+    private func mergedDevice(_ currentDevice: NetworkDevice, with incomingDevice: NetworkDevice) -> NetworkDevice {
+        var nextDevice = incomingDevice
+        nextDevice.hostname = incomingDevice.hostname ?? currentDevice.hostname
+        nextDevice.dnsName = incomingDevice.dnsName ?? currentDevice.dnsName
+        nextDevice.macAddress = incomingDevice.macAddress ?? currentDevice.macAddress
+        nextDevice.vendor = incomingDevice.vendor ?? currentDevice.vendor
+        nextDevice.responseTimeMS = incomingDevice.responseTimeMS ?? currentDevice.responseTimeMS
+        return nextDevice
     }
 }
 
 struct HeaderPanel: View {
     let network: LocalNetwork?
     let isScanning: Bool
+    let isScanDisabled: Bool
+    let isResetDisabled: Bool
     let onScan: () -> Void
+    let onReset: () -> Void
 
     var body: some View {
-        HStack(alignment: .center, spacing: 12) {
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 8) {
-                    Text("Network")
-                        .font(.system(size: 14, weight: .bold))
-                        .textCase(.uppercase)
-                        .foregroundStyle(AppColors.caption)
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .center, spacing: 12) {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 8) {
+                        ScannerLabel()
 
-                    Button {
-                        onScan()
-                    } label: {
-                        IconPillLabel(isScanning ? "Scanning" : "Scan", systemImage: "dot.radiowaves.left.and.right")
+                        Button {
+                            onScan()
+                        } label: {
+                            PillLabel(isScanning ? "Scanning" : "Scan")
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(isScanDisabled)
+
+                        Button {
+                            onReset()
+                        } label: {
+                            PillLabel("Clear", isActive: false)
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(isResetDisabled)
                     }
-                    .buttonStyle(.plain)
-                    .disabled(isScanning)
+
+                    Text(network?.displayName ?? "No local IPv4 network")
+                        .font(.system(size: 22, weight: .bold))
+                        .foregroundStyle(AppColors.heading)
+                        .lineLimit(1)
                 }
 
-                Text(network?.displayName ?? "No local IPv4 network")
-                    .font(.system(size: 22, weight: .bold))
-                    .foregroundStyle(AppColors.heading)
-                    .lineLimit(1)
-            }
+                Spacer()
 
-            Spacer()
+                HStack(spacing: 8) {
+                    AppLogoIcon()
+                        .frame(width: 34, height: 34)
 
-            HStack(spacing: 8) {
-                Image(systemName: "dot.radiowaves.left.and.right")
-                    .font(.system(size: 30, weight: .bold))
-                    .foregroundStyle(AppColors.primaryStrong)
-                HStack(alignment: .firstTextBaseline, spacing: 5) {
-                    Text("LAN")
-                        .font(.system(size: 28, weight: .bold))
-                    Text("scanner")
-                        .font(.system(size: 17, weight: .semibold, design: .serif).italic())
+                    HStack(alignment: .firstTextBaseline, spacing: 7) {
+                        Text("LAN")
+                            .font(.system(size: 23, weight: .bold))
+                        Text("Scanner")
+                            .font(.system(size: 23, weight: .bold))
+                    }
                 }
+                .foregroundStyle(AppColors.primaryStrong)
             }
-            .foregroundStyle(AppColors.primaryStrong)
         }
-        .padding(18)
+        .padding(20)
         .background(AppColors.panelBackground)
-        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .panelChrome()
     }
 }
 
-struct ScannerSplitView: View {
-    let devices: [NetworkDevice]
-    let selectedDevice: NetworkDevice?
-    let isScanningServices: Bool
-    @Binding var devicePanelWidth: CGFloat?
-    let onSelect: (NetworkDevice) -> Void
-
-    private let dividerWidth: CGFloat = 14
-    private let minDeviceWidth: CGFloat = 360
-    private let minDetailWidth: CGFloat = 320
-    private let defaultDetailWidth: CGFloat = 380
-
+struct ScannerLabel: View {
     var body: some View {
-        GeometryReader { proxy in
-            let availableWidth = proxy.size.width
-            let deviceWidth = clampedDeviceWidth(for: availableWidth)
-
-            HStack(spacing: 0) {
-                DeviceListPanel(
-                    devices: devices,
-                    selectedDevice: selectedDevice,
-                    onSelect: onSelect
-                )
-                .frame(width: deviceWidth)
-
-                SplitDivider()
-                    .frame(width: dividerWidth)
-                    .gesture(
-                        DragGesture(minimumDistance: 0, coordinateSpace: .named("ScannerSplitView"))
-                            .onChanged { value in
-                                devicePanelWidth = clampedDeviceWidth(
-                                    value.location.x - (dividerWidth / 2),
-                                    availableWidth: availableWidth
-                                )
-                            }
-                    )
-
-                DeviceDetailPanel(
-                    device: selectedDevice,
-                    isScanningServices: isScanningServices
-                )
-                .frame(width: max(minDetailWidth, availableWidth - deviceWidth - dividerWidth))
-            }
-            .coordinateSpace(name: "ScannerSplitView")
-        }
-    }
-
-    private func clampedDeviceWidth(for availableWidth: CGFloat) -> CGFloat {
-        let preferredWidth = devicePanelWidth ?? max(minDeviceWidth, availableWidth - dividerWidth - defaultDetailWidth)
-        return clampedDeviceWidth(preferredWidth, availableWidth: availableWidth)
-    }
-
-    private func clampedDeviceWidth(_ width: CGFloat, availableWidth: CGFloat) -> CGFloat {
-        let maxDeviceWidth = max(minDeviceWidth, availableWidth - dividerWidth - minDetailWidth)
-        return min(max(width, minDeviceWidth), maxDeviceWidth)
+        Text("Network")
+            .font(.system(size: 13, weight: .bold))
+            .textCase(.uppercase)
+            .foregroundStyle(AppColors.caption)
     }
 }
 
-struct SplitDivider: View {
+struct AppLogoIcon: View {
     var body: some View {
         ZStack {
-            Rectangle()
-                .fill(Color.clear)
+            Circle()
+                .fill(AppColors.primaryStrong)
 
-            Capsule()
-                .fill(AppColors.fieldBorder)
-                .frame(width: 4)
+            Image(systemName: "dot.radiowaves.left.and.right")
+                .font(.system(size: 20, weight: .bold))
+                .foregroundStyle(AppColors.panelBackground)
         }
-        .contentShape(Rectangle())
-        .onHover { isHovering in
-            if isHovering {
-                NSCursor.resizeLeftRight.set()
-            } else {
-                NSCursor.arrow.set()
-            }
-        }
+        .aspectRatio(1, contentMode: .fit)
     }
 }
 
 struct DeviceListPanel: View {
     let devices: [NetworkDevice]
-    let selectedDevice: NetworkDevice?
-    let onSelect: (NetworkDevice) -> Void
+    @Binding var sortColumn: DeviceSortColumn
+    @Binding var sortAscending: Bool
+    @State private var selectedDeviceID: String?
+    @State private var inspectedDevice: InspectedDevice?
+    @State private var inspectingDevice: NetworkDevice?
+
+    private let scanner = LANScanner()
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 10) {
-                Text("Devices")
-                    .font(.caption)
-                    .fontWeight(.bold)
-                    .textCase(.uppercase)
-                    .foregroundStyle(AppColors.caption)
+        ZStack {
+            VStack(spacing: 0) {
+                HStack(spacing: 10) {
+                    Text("Devices")
+                        .font(.caption)
+                        .fontWeight(.bold)
+                        .textCase(.uppercase)
+                        .foregroundStyle(AppColors.caption)
 
-                Spacer()
+                    Spacer()
 
-                PillLabel("\(devices.count) devices", isActive: false)
-            }
-            .padding([.horizontal, .top], 16)
-            .padding(.bottom, 10)
+                    PillLabel("\(devices.count) devices", isActive: false)
+                }
+                .padding([.horizontal, .top], 16)
+                .padding(.bottom, 10)
 
-            ScrollView {
-                LazyVStack(spacing: 4) {
-                    ForEach(devices) { device in
-                        DeviceRow(device: device, isSelected: selectedDevice?.id == device.id)
+                DeviceTableHeader(sortColumn: $sortColumn, sortAscending: $sortAscending)
+                    .padding(.trailing, DeviceTableColumns.scrollbarGutter)
+
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(Array(devices.enumerated()), id: \.element.id) { index, device in
+                            DeviceTableRow(
+                                device: device,
+                                isSelected: selectedDeviceID == device.id,
+                                isAlternate: index.isMultiple(of: 2),
+                                onInfo: {
+                                    selectedDeviceID = device.id
+                                    inspect(device)
+                                }
+                            )
                             .onTapGesture {
-                                onSelect(device)
+                                selectedDeviceID = device.id
                             }
-                    }
-                }
-                .padding(.horizontal, 10)
-                .padding(.bottom, 16)
-            }
-        }
-        .background(AppColors.panelBackground)
-        .clipShape(RoundedRectangle(cornerRadius: 8))
-    }
-}
-
-struct DeviceRow: View {
-    let device: NetworkDevice
-    let isSelected: Bool
-
-    var body: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "desktopcomputer")
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundStyle(AppColors.treeDisclosure)
-                .frame(width: 24)
-
-            VStack(alignment: .leading, spacing: 3) {
-                HStack(spacing: 7) {
-                    Text(device.displayName)
-                        .font(.system(size: 14, weight: isSelected ? .semibold : .regular))
-                        .foregroundStyle(isSelected ? AppColors.heading : AppColors.topicName)
-                        .lineLimit(1)
-                }
-
-                HStack(spacing: 8) {
-                    Text(device.ipAddress)
-                    if let mac = device.macAddress {
-                        Text(mac)
-                    }
-                    if let responseTime = device.responseTimeMS {
-                        Text("\(Int(responseTime.rounded())) ms")
-                    }
-                }
-                .font(.system(size: 11, design: .monospaced))
-                .foregroundStyle(AppColors.badgeText)
-                .lineLimit(1)
-            }
-
-            Spacer()
-        }
-        .padding(.horizontal, 10)
-        .frame(height: 50)
-        .background(isSelected ? AppColors.selectionBackground : Color.clear)
-        .clipShape(RoundedRectangle(cornerRadius: 6))
-        .contentShape(Rectangle())
-    }
-}
-
-struct DeviceDetailPanel: View {
-    let device: NetworkDevice?
-    let isScanningServices: Bool
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack {
-                Text("Details")
-                    .font(.caption)
-                    .fontWeight(.bold)
-                    .textCase(.uppercase)
-                    .foregroundStyle(AppColors.caption)
-
-                Spacer()
-            }
-
-            if let device {
-                DetailField(label: "Name", value: device.displayName)
-                DetailField(label: "IP Address", value: device.ipAddress)
-                DetailField(label: "MAC Address", value: device.macAddress ?? "-")
-                DetailField(label: "Vendor", value: device.vendor ?? "-")
-                DetailField(label: "Last Seen", value: DateFormatter.scanner.string(from: device.lastSeen))
-
-                Text("Services")
-                    .font(.caption)
-                    .fontWeight(.bold)
-                    .textCase(.uppercase)
-                    .foregroundStyle(AppColors.caption)
-
-                if isScanningServices {
-                    Text("Checking services...")
-                        .foregroundStyle(AppColors.badgeText)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(12)
-                        .background(AppColors.readOnlyBackground)
-                        .clipShape(RoundedRectangle(cornerRadius: 6))
-                } else if detailPills(for: device).isEmpty {
-                    Text("No common services detected")
-                        .foregroundStyle(AppColors.badgeText)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(12)
-                        .background(AppColors.readOnlyBackground)
-                        .clipShape(RoundedRectangle(cornerRadius: 6))
-                } else {
-                    FlowPillRow(spacing: 8, rowSpacing: 8) {
-                        ForEach(detailPills(for: device)) { pill in
-                            IconPillLabel(pill.text, systemImage: pill.systemImage)
                         }
                     }
+                    .padding(.bottom, 10)
                 }
-            } else {
-                Spacer()
-                Text("Run a scan or select a device.")
-                    .font(.system(size: 16, weight: .semibold))
-                    .foregroundStyle(AppColors.badgeText)
-                    .frame(maxWidth: .infinity, alignment: .center)
-                Spacer()
             }
 
-            Spacer()
+            if let inspectingDevice {
+                DeviceInspectingOverlay(device: inspectingDevice)
+            }
         }
-        .padding(18)
         .background(AppColors.panelBackground)
-        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .panelChrome()
+        .sheet(item: $inspectedDevice) { inspectedDevice in
+            DeviceInfoDialog(device: inspectedDevice.device, inspection: inspectedDevice.inspection)
+        }
     }
 
-    private func detailPills(for device: NetworkDevice) -> [DetailPill] {
-        device.services.map { service in
-            DetailPill(text: "\(service.name) \(service.port)", systemImage: service.systemImage)
+    private func inspect(_ device: NetworkDevice) {
+        guard inspectingDevice == nil else {
+            return
+        }
+
+        inspectingDevice = device
+
+        Task {
+            let inspection = await scanner.inspect(device: device)
+            inspectingDevice = nil
+            inspectedDevice = InspectedDevice(device: device, inspection: inspection)
+        }
+    }
+
+}
+
+struct InspectedDevice: Identifiable {
+    let device: NetworkDevice
+    let inspection: DeviceInspection
+
+    var id: String { device.id }
+}
+
+struct DeviceInspectingOverlay: View {
+    let device: NetworkDevice
+
+    var body: some View {
+        VStack(spacing: 10) {
+            ProgressView()
+                .scaleEffect(0.8)
+
+            Text("Inspecting device...")
+                .font(.system(size: 14, weight: .bold))
+                .foregroundStyle(AppColors.heading)
+
+            Text(device.displayName)
+                .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                .foregroundStyle(AppColors.badgeText)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+        .padding(.horizontal, 22)
+        .padding(.vertical, 18)
+        .frame(width: 250)
+        .background(AppColors.panelBackground)
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(AppColors.panelBorder, lineWidth: 1)
+        }
+        .shadow(radius: 14)
+    }
+}
+
+struct DeviceTableHeader: View {
+    @Binding var sortColumn: DeviceSortColumn
+    @Binding var sortAscending: Bool
+
+    var body: some View {
+        LazyVGrid(columns: DeviceTableColumns.columns, spacing: 0) {
+            DeviceHeaderCell(column: .name, sortColumn: $sortColumn, sortAscending: $sortAscending)
+            DeviceHeaderCell(column: .ipAddress, sortColumn: $sortColumn, sortAscending: $sortAscending)
+            DeviceHeaderCell(column: .macAddress, sortColumn: $sortColumn, sortAscending: $sortAscending)
+            DeviceHeaderCell(column: .vendor, sortColumn: $sortColumn, sortAscending: $sortAscending)
+            DeviceHeaderCell(column: .dnsName, sortColumn: $sortColumn, sortAscending: $sortAscending)
+        }
+        .padding(.horizontal, 12)
+        .padding(.top, 2)
+        .padding(.bottom, 12)
+        .background(AppColors.panelBackground)
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(AppColors.panelBorder)
+                .frame(height: 1)
         }
     }
 }
 
-struct DetailPill: Identifiable, Hashable {
+enum DeviceTableColumns {
+    static let scrollbarGutter: CGFloat = 16
+
+    static let columns: [GridItem] = [
+        GridItem(.flexible(minimum: 260), spacing: 6, alignment: .leading),
+        GridItem(.flexible(minimum: 150, maximum: 190), spacing: 6, alignment: .leading),
+        GridItem(.flexible(minimum: 190, maximum: 240), spacing: 6, alignment: .leading),
+        GridItem(.flexible(minimum: 220), spacing: 6, alignment: .leading),
+        GridItem(.flexible(minimum: 260), spacing: 0, alignment: .leading)
+    ]
+}
+
+struct DeviceHeaderCell: View {
+    let column: DeviceSortColumn
+    @Binding var sortColumn: DeviceSortColumn
+    @Binding var sortAscending: Bool
+
+    var body: some View {
+        Button {
+            if sortColumn == column {
+                sortAscending.toggle()
+            } else {
+                sortColumn = column
+                sortAscending = true
+            }
+        } label: {
+            HStack(spacing: 0) {
+                HStack(spacing: 6) {
+                    Text(column.title)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.82)
+                    Image(systemName: sortIcon)
+                        .font(.system(size: 9, weight: .bold))
+                        .opacity(isActive ? 1 : 0.42)
+                }
+                .font(.system(size: 12, weight: .bold))
+                .foregroundStyle(isActive ? AppColors.primaryStrong : AppColors.badgeText)
+                .padding(.horizontal, 8)
+                .frame(height: 24)
+                .background(isActive ? AppColors.badgeBackground : AppColors.neutralBadgeBackground)
+                .clipShape(Capsule())
+                .overlay {
+                    Capsule()
+                        .stroke(isActive ? AppColors.primary.opacity(0.75) : AppColors.fieldBorder, lineWidth: 1)
+                }
+                .fixedSize(horizontal: true, vertical: false)
+
+                Spacer(minLength: 0)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var isActive: Bool {
+        sortColumn == column
+    }
+
+    private var sortIcon: String {
+        guard isActive else {
+            return "arrow.up.arrow.down"
+        }
+
+        return sortAscending ? "chevron.up" : "chevron.down"
+    }
+}
+
+struct DeviceTableRow: View {
+    let device: NetworkDevice
+    let isSelected: Bool
+    let isAlternate: Bool
+    let onInfo: () -> Void
+
+    var body: some View {
+        LazyVGrid(columns: DeviceTableColumns.columns, spacing: 0) {
+            DeviceTableCell(isPrimary: true) {
+                HStack(spacing: 9) {
+                    Button(action: onInfo) {
+                        Image(systemName: "info.circle")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(AppColors.badgeText)
+                            .frame(width: 18, height: 20)
+                            .contentShape(Circle())
+                    }
+                    .buttonStyle(.plain)
+
+                    Text(device.displayName)
+                        .lineLimit(1)
+                }
+            }
+
+            DeviceTableCell(isMonospaced: true) { Text(device.ipAddress) }
+            DeviceTableCell(isMonospaced: true) { Text(device.macAddress ?? "-") }
+            DeviceTableCell { Text(device.vendor ?? "-") }
+            DeviceTableCell { Text(device.dnsName ?? "-") }
+        }
+        .padding(.horizontal, 12)
+        .frame(height: 34)
+        .background(rowBackground)
+        .contentShape(Rectangle())
+    }
+
+    private var rowBackground: Color {
+        if isSelected {
+            return AppColors.selectionBackground
+        }
+
+        return isAlternate ? AppColors.tableRowBackground : AppColors.tableAlternateRowBackground
+    }
+}
+
+struct DeviceTableCell<Content: View>: View {
+    var isPrimary = false
+    var isMonospaced = false
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        HStack(spacing: 0) {
+            content()
+                .font(.system(size: isPrimary ? 14 : 13, weight: isPrimary ? .semibold : .regular, design: isMonospaced ? .monospaced : .default))
+                .foregroundStyle(isPrimary ? AppColors.heading : AppColors.topicName)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+struct DeviceInfoDialog: View {
+    @Environment(\.dismiss) private var dismiss
+    let device: NetworkDevice
+    let inspection: DeviceInspection
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(spacing: 10) {
+                Image(systemName: "info.circle.fill")
+                    .font(.system(size: 24, weight: .semibold))
+                    .foregroundStyle(AppColors.primaryStrong)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Device Inspection")
+                        .font(.system(size: 20, weight: .bold))
+                        .foregroundStyle(AppColors.heading)
+                    Text(device.displayName)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(AppColors.badgeText)
+                }
+
+                Spacer()
+            }
+
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 8) {
+                    Text("Findings")
+                        .font(.caption)
+                        .fontWeight(.bold)
+                        .textCase(.uppercase)
+                        .foregroundStyle(AppColors.caption)
+
+                    Spacer()
+                }
+
+                ScrollView {
+                    inspectionContent
+                }
+                .frame(maxHeight: 420)
+            }
+
+            HStack {
+                Spacer()
+                Button("Close") {
+                    dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(22)
+        .frame(width: 520, height: 560)
+        .background(AppColors.panelBackground)
+    }
+
+    @ViewBuilder
+    private var inspectionContent: some View {
+        if inspection.hasFindings {
+            VStack(spacing: 0) {
+                ForEach(inspection.likelyTypes, id: \.self) { type in
+                    DeviceInspectionResultRow(
+                        title: type,
+                        detail: "Likely device type",
+                        systemImage: "sparkles"
+                    )
+                }
+
+                ForEach(inspection.openServices) { service in
+                    DeviceInspectionResultRow(
+                        title: service.name,
+                        detail: service.port.map { "Port \($0) - \(service.detail)" } ?? service.detail,
+                        systemImage: service.systemImage
+                    )
+                }
+
+                ForEach(inspection.systemFindings) { finding in
+                    DeviceInspectionResultRow(
+                        title: finding.name,
+                        detail: finding.detail,
+                        systemImage: finding.systemImage
+                    )
+                }
+
+                ForEach(inspection.notes, id: \.self) { note in
+                    DeviceInspectionResultRow(
+                        title: "Note",
+                        detail: note,
+                        systemImage: "note.text"
+                    )
+                }
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .overlay {
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(AppColors.panelBorder, lineWidth: 1)
+            }
+        } else {
+            DeviceInspectionMessage(text: "No open known services found. Only local device data is available.", systemImage: "checkmark.circle")
+        }
+    }
+}
+
+struct DeviceInspectionMessage: View {
     let text: String
     let systemImage: String
 
-    var id: String { "\(systemImage)-\(text)" }
-}
-
-struct FlowPillRow: Layout {
-    var spacing: CGFloat = 8
-    var rowSpacing: CGFloat = 8
-
-    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
-        let rows = rows(for: subviews, maxWidth: proposal.width ?? .infinity)
-        let width = rows.map(\.width).max() ?? 0
-        let height = rows.reduce(CGFloat.zero) { total, row in
-            total + row.height
-        } + CGFloat(max(0, rows.count - 1)) * rowSpacing
-
-        return CGSize(width: width, height: height)
-    }
-
-    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
-        let rows = rows(for: subviews, maxWidth: bounds.width)
-        var y = bounds.minY
-
-        for row in rows {
-            var x = bounds.minX
-            for index in row.indices {
-                let size = subviews[index].sizeThatFits(.unspecified)
-                subviews[index].place(
-                    at: CGPoint(x: x, y: y + (row.height - size.height) / 2),
-                    proposal: ProposedViewSize(size)
-                )
-                x += size.width + spacing
-            }
-            y += row.height + rowSpacing
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: systemImage)
+            Text(text)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
-    }
-
-    private func rows(for subviews: Subviews, maxWidth: CGFloat) -> [FlowRow] {
-        var rows: [FlowRow] = []
-        var current = FlowRow()
-
-        for index in subviews.indices {
-            let size = subviews[index].sizeThatFits(.unspecified)
-            let candidateWidth = current.indices.isEmpty ? size.width : current.width + spacing + size.width
-
-            if candidateWidth > maxWidth, !current.indices.isEmpty {
-                rows.append(current)
-                current = FlowRow()
-            }
-
-            current.indices.append(index)
-            current.width = current.width == 0 ? size.width : current.width + spacing + size.width
-            current.height = max(current.height, size.height)
+        .font(.system(size: 13, weight: .semibold))
+        .foregroundStyle(AppColors.badgeText)
+        .padding(12)
+        .background(AppColors.tableRowBackground)
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(AppColors.panelBorder, lineWidth: 1)
         }
-
-        if !current.indices.isEmpty {
-            rows.append(current)
-        }
-
-        return rows
     }
 }
 
-private struct FlowRow {
-    var indices: [Int] = []
-    var width: CGFloat = 0
-    var height: CGFloat = 0
-}
-
-struct DetailField: View {
-    let label: String
-    let value: String
+struct DeviceInspectionResultRow: View {
+    let title: String
+    let detail: String
+    let systemImage: String
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Text(label)
-                .font(.caption)
-                .fontWeight(.bold)
-                .textCase(.uppercase)
-                .foregroundStyle(AppColors.caption)
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: systemImage)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(AppColors.primaryStrong)
+                .frame(width: 18)
 
-            Text(value)
-                .font(.system(size: 13, weight: .medium, design: label.contains("Address") ? .monospaced : .default))
-                .foregroundStyle(AppColors.heading)
-                .lineLimit(1)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 10)
-                .frame(height: 34)
-                .background(AppColors.readOnlyBackground)
-                .clipShape(RoundedRectangle(cornerRadius: 6))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 6)
-                        .stroke(AppColors.readOnlyBorder)
-                }
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundStyle(AppColors.heading)
+                Text(detail)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(AppColors.badgeText)
+                    .textSelection(.enabled)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .background(AppColors.tableRowBackground)
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(AppColors.panelBorder)
+                .frame(height: 1)
         }
     }
 }
@@ -562,7 +760,7 @@ struct StatusBar: View {
         .frame(height: 40)
         .padding(.horizontal, 14)
         .background(AppColors.panelBackground)
-        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .panelChrome()
     }
 
     private var statusTint: Color {
@@ -574,6 +772,17 @@ struct StatusBar: View {
         case .failed:
             return AppColors.danger
         }
+    }
+}
+
+extension View {
+    func panelChrome() -> some View {
+        self
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .overlay {
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(AppColors.panelBorder, lineWidth: 1)
+            }
     }
 }
 
@@ -677,6 +886,7 @@ enum AppColors {
 
     static var pageBackground: Color { theme.pageBackground }
     static var panelBackground: Color { theme.panelBackground }
+    static var panelBorder: Color { theme.panelBorder }
     static var inputBackground: Color { theme.inputBackground }
     static var fieldBorder: Color { theme.softBorder }
     static let caption = adaptive(light: nsColor(0.44, 0.46, 0.49), dark: nsColor(0.66, 0.71, 0.69))
@@ -688,6 +898,9 @@ enum AppColors {
     static var primaryStrong: Color { theme.primaryStrong }
     static var badgeBackground: Color { theme.softBackground }
     static var neutralBadgeBackground: Color { theme.neutralBackground }
+    static var tableHeaderBackground: Color { theme.tableHeaderBackground }
+    static var tableRowBackground: Color { theme.tableRowBackground }
+    static var tableAlternateRowBackground: Color { theme.tableAlternateRowBackground }
     static var previewBackground: Color { theme.previewBackground }
     static var previewText: Color { theme.previewText }
     static let danger = adaptive(light: nsColor(0.86, 0.20, 0.18), dark: nsColor(1.00, 0.38, 0.34))
@@ -709,12 +922,16 @@ enum AppColors {
 struct AppTheme {
     let pageBackground: Color
     let panelBackground: Color
+    let panelBorder: Color
     let inputBackground: Color
     let primary: Color
     let primaryStrong: Color
     let softBackground: Color
     let softBorder: Color
     let neutralBackground: Color
+    let tableHeaderBackground: Color
+    let tableRowBackground: Color
+    let tableAlternateRowBackground: Color
     let previewBackground: Color
     let previewText: Color
 
@@ -722,27 +939,35 @@ struct AppTheme {
         switch surface {
         case .hard:
             return AppTheme(
-                pageBackground: AppColors.adaptive(light: AppColors.nsColor(0.33, 0.51, 0.69), dark: AppColors.nsColor(0.08, 0.12, 0.16)),
-                panelBackground: AppColors.adaptive(light: AppColors.nsColor(1, 1, 1), dark: AppColors.nsColor(0.11, 0.15, 0.19)),
-                inputBackground: AppColors.adaptive(light: AppColors.nsColor(1, 1, 1), dark: AppColors.nsColor(0.09, 0.14, 0.18)),
-                primary: AppColors.adaptive(light: AppColors.nsColor(0.33, 0.51, 0.69), dark: AppColors.nsColor(0.44, 0.58, 0.73)),
-                primaryStrong: AppColors.adaptive(light: AppColors.nsColor(0.13, 0.20, 0.27), dark: AppColors.nsColor(0.85, 0.90, 0.95)),
-                softBackground: AppColors.adaptive(light: AppColors.nsColor(0.78, 0.86, 0.92), dark: AppColors.nsColor(0.09, 0.16, 0.22)),
-                softBorder: AppColors.adaptive(light: AppColors.nsColor(0.52, 0.68, 0.81), dark: AppColors.nsColor(0.26, 0.42, 0.57)),
-                neutralBackground: AppColors.adaptive(light: AppColors.nsColor(0.88, 0.93, 0.96), dark: AppColors.nsColor(0.14, 0.18, 0.22)),
-                previewBackground: AppColors.adaptive(light: AppColors.nsColor(0.84, 0.91, 0.96), dark: AppColors.nsColor(0.09, 0.17, 0.24)),
-                previewText: AppColors.adaptive(light: AppColors.nsColor(0.13, 0.30, 0.47), dark: AppColors.nsColor(0.57, 0.75, 0.91))
+                pageBackground: AppColors.adaptive(light: AppColors.nsColor(0.42, 0.58, 0.72), dark: AppColors.nsColor(0.02, 0.07, 0.14)),
+                panelBackground: AppColors.adaptive(light: AppColors.nsColor(0.98, 1.00, 1.00), dark: AppColors.nsColor(0.07, 0.11, 0.17)),
+                panelBorder: AppColors.adaptive(light: AppColors.nsColor(0.83, 0.91, 0.98), dark: AppColors.nsColor(0.13, 0.24, 0.35)),
+                inputBackground: AppColors.adaptive(light: AppColors.nsColor(0.99, 1.00, 1.00), dark: AppColors.nsColor(0.05, 0.10, 0.16)),
+                primary: AppColors.adaptive(light: AppColors.nsColor(0.08, 0.36, 0.62), dark: AppColors.nsColor(0.35, 0.58, 0.86)),
+                primaryStrong: AppColors.adaptive(light: AppColors.nsColor(0.02, 0.19, 0.36), dark: AppColors.nsColor(0.73, 0.86, 1.00)),
+                softBackground: AppColors.adaptive(light: AppColors.nsColor(0.79, 0.88, 0.96), dark: AppColors.nsColor(0.05, 0.15, 0.25)),
+                softBorder: AppColors.adaptive(light: AppColors.nsColor(0.42, 0.62, 0.82), dark: AppColors.nsColor(0.20, 0.42, 0.64)),
+                neutralBackground: AppColors.adaptive(light: AppColors.nsColor(0.88, 0.93, 0.97), dark: AppColors.nsColor(0.10, 0.14, 0.20)),
+                tableHeaderBackground: AppColors.adaptive(light: AppColors.nsColor(0.90, 0.95, 0.99), dark: AppColors.nsColor(0.08, 0.13, 0.20)),
+                tableRowBackground: AppColors.adaptive(light: AppColors.nsColor(0.98, 1.00, 1.00), dark: AppColors.nsColor(0.07, 0.11, 0.17)),
+                tableAlternateRowBackground: AppColors.adaptive(light: AppColors.nsColor(0.94, 0.98, 1.00), dark: AppColors.nsColor(0.09, 0.14, 0.21)),
+                previewBackground: AppColors.adaptive(light: AppColors.nsColor(0.83, 0.91, 0.98), dark: AppColors.nsColor(0.04, 0.14, 0.24)),
+                previewText: AppColors.adaptive(light: AppColors.nsColor(0.04, 0.27, 0.48), dark: AppColors.nsColor(0.54, 0.76, 1.00))
             )
         case .grass:
             return AppTheme(
                 pageBackground: AppColors.adaptive(light: AppColors.nsColor(0.28, 0.62, 0.46), dark: AppColors.nsColor(0.08, 0.13, 0.12)),
                 panelBackground: AppColors.adaptive(light: AppColors.nsColor(1, 1, 1), dark: AppColors.nsColor(0.11, 0.16, 0.14)),
+                panelBorder: AppColors.adaptive(light: AppColors.nsColor(0.82, 0.93, 0.87), dark: AppColors.nsColor(0.15, 0.28, 0.22)),
                 inputBackground: AppColors.adaptive(light: AppColors.nsColor(1, 1, 1), dark: AppColors.nsColor(0.09, 0.14, 0.12)),
                 primary: AppColors.adaptive(light: AppColors.nsColor(0.18, 0.74, 0.51), dark: AppColors.nsColor(0.25, 0.80, 0.57)),
                 primaryStrong: AppColors.adaptive(light: AppColors.nsColor(0.08, 0.52, 0.36), dark: AppColors.nsColor(0.46, 0.88, 0.68)),
                 softBackground: AppColors.adaptive(light: AppColors.nsColor(0.78, 0.92, 0.85), dark: AppColors.nsColor(0.08, 0.22, 0.17)),
                 softBorder: AppColors.adaptive(light: AppColors.nsColor(0.46, 0.78, 0.65), dark: AppColors.nsColor(0.18, 0.56, 0.40)),
                 neutralBackground: AppColors.adaptive(light: AppColors.nsColor(0.89, 0.95, 0.91), dark: AppColors.nsColor(0.14, 0.19, 0.17)),
+                tableHeaderBackground: AppColors.adaptive(light: AppColors.nsColor(0.88, 0.96, 0.91), dark: AppColors.nsColor(0.12, 0.19, 0.16)),
+                tableRowBackground: AppColors.adaptive(light: AppColors.nsColor(0.99, 1.00, 0.99), dark: AppColors.nsColor(0.10, 0.16, 0.14)),
+                tableAlternateRowBackground: AppColors.adaptive(light: AppColors.nsColor(0.93, 0.98, 0.95), dark: AppColors.nsColor(0.13, 0.20, 0.17)),
                 previewBackground: AppColors.adaptive(light: AppColors.nsColor(0.82, 0.94, 0.88), dark: AppColors.nsColor(0.07, 0.23, 0.17)),
                 previewText: AppColors.adaptive(light: AppColors.nsColor(0.02, 0.48, 0.34), dark: AppColors.nsColor(0.36, 0.88, 0.62))
             )
@@ -750,12 +975,16 @@ struct AppTheme {
             return AppTheme(
                 pageBackground: AppColors.adaptive(light: AppColors.nsColor(0.58, 0.31, 0.24), dark: AppColors.nsColor(0.16, 0.10, 0.08)),
                 panelBackground: AppColors.adaptive(light: AppColors.nsColor(1, 1, 1), dark: AppColors.nsColor(0.17, 0.12, 0.10)),
+                panelBorder: AppColors.adaptive(light: AppColors.nsColor(0.96, 0.84, 0.78), dark: AppColors.nsColor(0.28, 0.18, 0.15)),
                 inputBackground: AppColors.adaptive(light: AppColors.nsColor(1, 1, 1), dark: AppColors.nsColor(0.15, 0.10, 0.09)),
                 primary: AppColors.adaptive(light: AppColors.nsColor(0.85, 0.42, 0.28), dark: AppColors.nsColor(0.89, 0.54, 0.41)),
                 primaryStrong: AppColors.adaptive(light: AppColors.nsColor(0.44, 0.20, 0.16), dark: AppColors.nsColor(0.99, 0.80, 0.72)),
                 softBackground: AppColors.adaptive(light: AppColors.nsColor(0.96, 0.84, 0.78), dark: AppColors.nsColor(0.23, 0.13, 0.10)),
                 softBorder: AppColors.adaptive(light: AppColors.nsColor(0.86, 0.58, 0.47), dark: AppColors.nsColor(0.62, 0.31, 0.24)),
                 neutralBackground: AppColors.adaptive(light: AppColors.nsColor(0.96, 0.90, 0.86), dark: AppColors.nsColor(0.22, 0.16, 0.14)),
+                tableHeaderBackground: AppColors.adaptive(light: AppColors.nsColor(0.98, 0.90, 0.86), dark: AppColors.nsColor(0.20, 0.13, 0.11)),
+                tableRowBackground: AppColors.adaptive(light: AppColors.nsColor(1.00, 0.99, 0.98), dark: AppColors.nsColor(0.17, 0.12, 0.10)),
+                tableAlternateRowBackground: AppColors.adaptive(light: AppColors.nsColor(0.98, 0.93, 0.90), dark: AppColors.nsColor(0.22, 0.15, 0.12)),
                 previewBackground: AppColors.adaptive(light: AppColors.nsColor(0.98, 0.88, 0.83), dark: AppColors.nsColor(0.24, 0.14, 0.11)),
                 previewText: AppColors.adaptive(light: AppColors.nsColor(0.58, 0.24, 0.16), dark: AppColors.nsColor(0.94, 0.60, 0.46))
             )
@@ -768,6 +997,12 @@ extension DateFormatter {
         let formatter = DateFormatter()
         formatter.dateStyle = .medium
         formatter.timeStyle = .medium
+        return formatter
+    }()
+
+    static let scannerTime: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss"
         return formatter
     }()
 }

@@ -5,6 +5,7 @@ struct NetworkDevice: Identifiable, Hashable {
 
     let ipAddress: String
     var hostname: String?
+    var dnsName: String?
     var macAddress: String?
     var vendor: String?
     var responseTimeMS: Double?
@@ -13,6 +14,36 @@ struct NetworkDevice: Identifiable, Hashable {
 
     var displayName: String {
         hostname?.isEmpty == false ? hostname! : ipAddress
+    }
+
+    var tableName: String {
+        displayName
+    }
+
+    var tableIPSortKey: String {
+        ipAddress
+            .split(separator: ".")
+            .map { String(format: "%03d", Int($0) ?? 0) }
+            .joined(separator: ".")
+    }
+
+    var tableMACAddress: String {
+        macAddress ?? ""
+    }
+
+    var tableVendor: String {
+        vendor ?? ""
+    }
+
+    var tableDNSName: String {
+        dnsName ?? ""
+    }
+
+    var tableServices: String {
+        services
+            .sorted { $0.port < $1.port }
+            .map(\.name)
+            .joined(separator: ", ")
     }
 }
 
@@ -43,6 +74,32 @@ struct NetworkService: Identifiable, Hashable {
         default:
             return "network"
         }
+    }
+}
+
+struct DeviceInspection: Hashable {
+    let likelyTypes: [String]
+    let openServices: [DeviceInspectionItem]
+    let systemFindings: [DeviceInspectionItem]
+    let notes: [String]
+
+    var hasFindings: Bool {
+        !likelyTypes.isEmpty || !openServices.isEmpty || !systemFindings.isEmpty || !notes.isEmpty
+    }
+}
+
+struct DeviceInspectionItem: Identifiable, Hashable {
+    let name: String
+    let detail: String
+    let port: Int?
+    let systemImage: String
+
+    var id: String {
+        if let port {
+            return "\(name)-\(port)"
+        }
+
+        return name
     }
 }
 
