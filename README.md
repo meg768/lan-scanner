@@ -18,6 +18,7 @@ A small native macOS app for scanning the local LAN and spotting devices such as
 ```bash
 swift build
 Scripts/build-app.sh
+Scripts/build-dmg.sh
 ```
 
 The app bundle is created at:
@@ -25,3 +26,13 @@ The app bundle is created at:
 ```text
 dist/LAN Scanner.app
 ```
+
+The DMG installer is created at:
+
+```text
+dist/lan-scanner.dmg
+```
+
+## Distribution
+
+The local build scripts create an ad-hoc-signed app bundle and DMG. For a frictionless web download on another Mac, the app must be signed with an Apple Developer ID certificate and notarized by Apple.

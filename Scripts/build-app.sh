@@ -43,4 +43,8 @@ if [[ -f "${ROOT_DIR}/Resources/GhostIcon.svg" ]]; then
 fi
 chmod +x "${MACOS_DIR}/${EXECUTABLE_NAME}"
 
+xattr -cr "${APP_DIR}"
+codesign --force --deep --sign - "${APP_DIR}"
+codesign --verify --deep --strict --verbose=2 "${APP_DIR}"
+
 echo "Built ${APP_DIR}"
