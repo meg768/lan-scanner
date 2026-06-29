@@ -27,16 +27,28 @@ struct NetworkDevice: Identifiable, Hashable {
             .joined(separator: ".")
     }
 
-    var tableMACAddress: String {
-        macAddress ?? ""
+    var addressText: String {
+        guard let macAddress, !macAddress.isEmpty else {
+            return ipAddress
+        }
+
+        return "\(ipAddress) (\(macAddress))"
     }
 
     var tableVendor: String {
         vendor ?? ""
     }
 
-    var tableDNSName: String {
-        dnsName ?? ""
+    var pingText: String {
+        guard let responseTimeMS else {
+            return "-"
+        }
+
+        if responseTimeMS < 10 {
+            return String(format: "%.1f ms", responseTimeMS)
+        }
+
+        return "\(Int(responseTimeMS.rounded())) ms"
     }
 
     var tableServices: String {

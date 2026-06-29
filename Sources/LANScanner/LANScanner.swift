@@ -31,16 +31,21 @@ actor LANScanner {
         let hostSet = Set(hosts)
         let total = hosts.count
         var completed = 0
+        var responseTimesByHost: [String: Double] = [:]
 
         for chunk in hosts.chunked(into: maxConcurrentPings) {
-            await withTaskGroup(of: Void.self) { group in
+            await withTaskGroup(of: (String, Double?).self) { group in
                 for host in chunk {
                     group.addTask {
-                        await self.ping(host)
+                        (host, await self.ping(host))
                     }
                 }
 
-                for await _ in group {
+                for await (host, responseTime) in group {
+                    if let responseTime {
+                        responseTimesByHost[host] = responseTime
+                    }
+
                     completed += 1
                     progress(completed, total)
                 }
@@ -48,7 +53,13 @@ actor LANScanner {
         }
 
         let devices = await Self.arpDevices(hostSet: hostSet)
-        return await resolveNames(for: devices).sorted {
+        let timedDevices = devices.map { device in
+            var nextDevice = device
+            nextDevice.responseTimeMS = responseTimesByHost[device.ipAddress]
+            return nextDevice
+        }
+
+        return await resolveNames(for: timedDevices).sorted {
             Self.ipSortKey($0.ipAddress).lexicographicallyPrecedes(Self.ipSortKey($1.ipAddress))
         }
     }
@@ -89,7 +100,7 @@ actor LANScanner {
         let services = await openServices
         let httpFindings = await Self.inspectHTTP(for: device.ipAddress, services: services)
         let sshFindings = services.contains { $0.name == "SSH" } ? await inspectSSH(device: device) : []
-        let systemFindings = httpFindings + sshFindings
+        let systemFindings = Self.localFindings(for: device) + httpFindings + sshFindings
         let notes = Self.inspectionNotes(for: device, likelyTypes: likelyTypes, services: services, systemFindings: systemFindings)
 
         return DeviceInspection(
@@ -101,9 +112,26 @@ actor LANScanner {
     }
 
     @discardableResult
-    private func ping(_ host: String) async -> Bool {
-        let result = await Self.run("/sbin/ping", arguments: ["-c", "1", "-W", "250", host], timeout: 1.25)
-        return result.exitCode == 0
+    private func ping(_ host: String) async -> Double? {
+        let result = await Self.run("/sbin/ping", arguments: ["-c", "2", "-W", "700", host], timeout: 3.0)
+        guard result.exitCode == 0 else {
+            return nil
+        }
+
+        return Self.pingResponseTime(from: result.output)
+    }
+
+    private static func pingResponseTime(from output: String) -> Double? {
+        guard let range = output.range(of: #"time[=<]([0-9.]+)\s*ms"#, options: .regularExpression) else {
+            return nil
+        }
+
+        let match = String(output[range])
+        guard let value = match.split(separator: "=").last ?? match.split(separator: "<").last else {
+            return nil
+        }
+
+        return Double(value.replacingOccurrences(of: " ms", with: ""))
     }
 
     private func openServices(for host: String) async -> [NetworkService] {
@@ -128,7 +156,10 @@ actor LANScanner {
             ServiceProbe(name: "RTSP camera", detail: "Camera/video stream", port: 554, systemImage: "video"),
             ServiceProbe(name: "SMB", detail: "Windows/macOS file sharing", port: 445, systemImage: "externaldrive.connected.to.line.below"),
             ServiceProbe(name: "AFP", detail: "Apple file sharing", port: 548, systemImage: "externaldrive.connected.to.line.below"),
+            ServiceProbe(name: "AirDrop / AWDL", detail: "Apple peer-to-peer sharing helper", port: 8770, systemImage: "airdrop"),
             ServiceProbe(name: "MQTT", detail: "IoT broker", port: 1883, systemImage: "dot.radiowaves.left.and.right"),
+            ServiceProbe(name: "Miio / robot vacuum", detail: "Xiaomi/Roborock local control", port: 54321, systemImage: "sensor"),
+            ServiceProbe(name: "Robot vacuum cloud bridge", detail: "Vendor/cloud helper endpoint", port: 58867, systemImage: "sensor"),
             ServiceProbe(name: "Node-RED", detail: "Automation dashboard", port: 1880, systemImage: "point.3.connected.trianglepath.dotted"),
             ServiceProbe(name: "Grafana / Node app", detail: "Dashboard or common Node.js app port", port: 3000, systemImage: "chart.xyaxis.line"),
             ServiceProbe(name: "Alt HTTP", detail: "Secondary web UI or proxy", port: 8080, systemImage: "globe"),
@@ -189,6 +220,7 @@ actor LANScanner {
 
     private func inspectSSH(device: NetworkDevice) async -> [DeviceInspectionItem] {
         let users = Self.sshUsers()
+        var findings: [DeviceInspectionItem] = []
 
         for user in users {
             let result = await Self.run(
@@ -198,8 +230,12 @@ actor LANScanner {
             )
 
             if result.exitCode == 0 {
-                return Self.sshFindings(from: result.output, user: user)
+                findings.append(contentsOf: Self.sshFindings(from: result.output, user: user))
             }
+        }
+
+        if !findings.isEmpty {
+            return Self.deduplicatedFindings(findings)
         }
 
         return [
@@ -210,6 +246,22 @@ actor LANScanner {
                 systemImage: "key.slash"
             )
         ]
+    }
+
+    private static func deduplicatedFindings(_ findings: [DeviceInspectionItem]) -> [DeviceInspectionItem] {
+        var seen: Set<String> = []
+        var deduplicated: [DeviceInspectionItem] = []
+
+        for finding in findings {
+            guard !seen.contains(finding.name) else {
+                continue
+            }
+
+            seen.insert(finding.name)
+            deduplicated.append(finding)
+        }
+
+        return deduplicated
     }
 
     private static func inspectHTTP(for host: String, services: [DeviceInspectionItem]) async -> [DeviceInspectionItem] {
@@ -328,7 +380,7 @@ actor LANScanner {
             "-o", "PreferredAuthentications=publickey",
             "-o", "PasswordAuthentication=no",
             "-o", "KbdInteractiveAuthentication=no",
-            "-o", "ConnectTimeout=2",
+            "-o", "ConnectTimeout=10",
             "-o", "StrictHostKeyChecking=accept-new",
             "\(user)@\(host)",
             sshInspectionScript
@@ -343,26 +395,30 @@ actor LANScanner {
     kv KERNEL "$(uname -srmo 2>/dev/null)"; \
     kv UPTIME "$(uptime -p 2>/dev/null)"; \
     kv ARCH "$(uname -m 2>/dev/null)"; \
-    kv NODE "$(node --version 2>/dev/null)"; \
-    kv NPM "$(npm --version 2>/dev/null)"; \
-    kv PYTHON3 "$(python3 --version 2>/dev/null)"; \
-    kv PYTHON "$(python --version 2>/dev/null)"; \
-    kv PM2 "$(pm2 --version 2>/dev/null)"; \
-    kv DOCKER "$(docker --version 2>/dev/null)"; \
-    kv DOCKER_CONTAINERS "$(docker ps --format "{{.Names}}" 2>/dev/null | paste -sd "," -)"; \
-    kv APACHE "$(apache2 -v 2>/dev/null | head -1)"; \
-    kv NGINX "$(nginx -v 2>&1 | head -1)"; \
-    kv MYSQL "$(mysql --version 2>/dev/null)"; \
-    kv MARIADB "$(mariadb --version 2>/dev/null)"; \
-    kv POSTGRES "$(psql --version 2>/dev/null)"; \
-    kv REDIS "$(redis-server --version 2>/dev/null | head -1)"; \
-    kv MOSQUITTO "$(mosquitto -h 2>/dev/null | head -1)"; \
-    kv JAVA "$(java -version 2>&1 | head -1)"; \
-    kv GO "$(go version 2>/dev/null)"; \
-    kv RUST "$(rustc --version 2>/dev/null)"; \
+    kv NODE "$(command -v node >/dev/null 2>&1 && timeout 2 node --version 2>/dev/null)"; \
+    kv NPM "$(command -v npm >/dev/null 2>&1 && timeout 2 npm --version 2>/dev/null)"; \
+    kv PYTHON3 "$(command -v python3 >/dev/null 2>&1 && timeout 2 python3 --version 2>/dev/null)"; \
+    kv PYTHON "$(command -v python >/dev/null 2>&1 && timeout 2 python --version 2>/dev/null)"; \
+    kv PM2 "$(command -v pm2 >/dev/null 2>&1 && { ps -eo args= 2>/dev/null | sed -n "s/^PM2 v\\([^:]*\\):.*/\\1/p" | head -1; })"; \
+    kv PM2_PROCESSES "$(command -v pm2 >/dev/null 2>&1 && { timeout 4 pm2 jlist 2>/dev/null | python3 -c "import json,sys; data=json.load(sys.stdin); print(\\",\\".join([p.get(\\"name\\",\\"\\") for p in data if p.get(\\"name\\")]))" 2>/dev/null; timeout 4 sudo -n env PM2_HOME=/root/.pm2 pm2 jlist 2>/dev/null | python3 -c "import json,sys; data=json.load(sys.stdin); print(\\",\\".join([p.get(\\"name\\",\\"\\") for p in data if p.get(\\"name\\")]))" 2>/dev/null; } | awk "NF" | paste -sd "," -)"; \
+    kv DOCKER "$(command -v docker >/dev/null 2>&1 && timeout 2 docker --version 2>/dev/null)"; \
+    kv DOCKER_CONTAINERS "$(command -v docker >/dev/null 2>&1 && timeout 2 docker ps --format "{{.Names}}" 2>/dev/null | paste -sd "," -)"; \
+    kv APACHE "$(command -v apache2 >/dev/null 2>&1 && timeout 2 apache2 -v 2>/dev/null | head -1)"; \
+    kv NGINX "$(command -v nginx >/dev/null 2>&1 && nginx -v 2>&1 | head -1)"; \
+    kv MYSQL "$(command -v mysql >/dev/null 2>&1 && timeout 2 mysql --version 2>/dev/null)"; \
+    kv MARIADB "$(command -v mariadb >/dev/null 2>&1 && timeout 2 mariadb --version 2>/dev/null)"; \
+    kv POSTGRES "$(command -v psql >/dev/null 2>&1 && timeout 2 psql --version 2>/dev/null)"; \
+    kv REDIS "$(command -v redis-server >/dev/null 2>&1 && timeout 2 redis-server --version 2>/dev/null | head -1)"; \
+    kv MOSQUITTO "$(command -v mosquitto >/dev/null 2>&1 && timeout 2 mosquitto -h 2>/dev/null | head -1)"; \
+    kv JAVA "$(command -v java >/dev/null 2>&1 && java -version 2>&1 | head -1)"; \
+    kv GO "$(command -v go >/dev/null 2>&1 && timeout 2 go version 2>/dev/null)"; \
+    kv RUST "$(command -v rustc >/dev/null 2>&1 && timeout 2 rustc --version 2>/dev/null)"; \
     kv DISK_ROOT "$(df -h / 2>/dev/null | awk "NR==2{print \\$3 \\" used of \\" \\$2 \\" (\\" \\$5 \\")\\"}")"; \
     kv MEMORY "$(free -h 2>/dev/null | awk "/^Mem:/{print \\$3 \\" used of \\" \\$2}")"; \
-    kv SYSTEMD_MATCHES "$(systemctl list-units --type=service --state=running --no-pager --no-legend 2>/dev/null | awk "{print \\$1}" | grep -Ei "node|pm2|docker|nginx|apache|mysql|mariadb|postgres|redis|mosquitto|home|assistant|nodered|grafana|influx|prometheus" | head -20 | paste -sd "," -)"; \
+    kv SYSTEMD_MATCHES "$(command -v systemctl >/dev/null 2>&1 && timeout 3 systemctl list-units --type=service --state=running --no-pager --no-legend 2>/dev/null | awk "{print \\$1}" | grep -Ei "node|pm2|docker|nginx|apache|mysql|mariadb|postgres|redis|mosquitto|home|assistant|nodered|grafana|influx|prometheus" | head -20 | paste -sd "," -)"; \
+    kv PROCESS_MATCHES "$(ps -eo comm= 2>/dev/null | grep -Ei "node|python|pm2|docker|nginx|apache|mysql|mariadb|postgres|redis|mosquitto|home|assistant|nodered|grafana|influx|prometheus|java|mqtt|zigbee|zwave" | sort -u | head -30 | paste -sd "," -)"; \
+    kv TOP_CPU "$(ps -eo pcpu,comm --sort=-pcpu 2>/dev/null | awk "NR>1 && \\$1+0>0 {print \\$2 \\" \\" \\$1 \\"%\\"}" | head -8 | paste -sd "," -)"; \
+    kv TOP_MEM "$(ps -eo pmem,comm --sort=-pmem 2>/dev/null | awk "NR>1 && \\$1+0>0 {print \\$2 \\" \\" \\$1 \\"%\\"}" | head -8 | paste -sd "," -)"; \
     kv HOME_DIRS "$(find /home -mindepth 1 -maxdepth 1 -type d -printf "%f " 2>/dev/null)"'
     """
 
@@ -375,7 +431,7 @@ actor LANScanner {
 
             let key = String(parts[0])
             let value = String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !value.isEmpty else {
+            guard isUsefulSSHValue(value) else {
                 return nil
             }
 
@@ -401,6 +457,7 @@ actor LANScanner {
         add("PYTHON3", name: "Python 3", icon: "chevron.left.forwardslash.chevron.right")
         add("PYTHON", name: "Python", icon: "chevron.left.forwardslash.chevron.right")
         add("PM2", name: "PM2", icon: "bolt.horizontal")
+        add("PM2_PROCESSES", name: "PM2 processes", icon: "list.bullet.rectangle")
         add("DOCKER", name: "Docker", icon: "shippingbox")
         add("DOCKER_CONTAINERS", name: "Docker containers", icon: "square.stack.3d.up")
         add("APACHE", name: "Apache", icon: "globe")
@@ -414,11 +471,30 @@ actor LANScanner {
         add("GO", name: "Go", icon: "chevron.left.forwardslash.chevron.right")
         add("RUST", name: "Rust", icon: "gearshape.2")
         add("SYSTEMD_MATCHES", name: "Running services", icon: "list.bullet.rectangle")
+        add("PROCESS_MATCHES", name: "Interesting processes", icon: "waveform.path.ecg.rectangle")
+        add("TOP_CPU", name: "Top CPU processes", icon: "speedometer")
+        add("TOP_MEM", name: "Top memory processes", icon: "memorychip")
         add("DISK_ROOT", name: "Root disk", icon: "internaldrive")
         add("MEMORY", name: "Memory", icon: "memorychip")
         add("HOME_DIRS", name: "Home directories", icon: "house")
 
         return findings
+    }
+
+    private static func isUsefulSSHValue(_ value: String) -> Bool {
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lowercased = normalized.lowercased()
+
+        guard !normalized.isEmpty else {
+            return false
+        }
+
+        return ![
+            "not found",
+            "command not found",
+            "no such file or directory",
+            "permission denied"
+        ].contains { lowercased.contains($0) }
     }
 
     private static func canConnect(host: String, port: Int) async -> Bool {
@@ -473,6 +549,7 @@ actor LANScanner {
 
         add("Raspberry Pi", if: haystack.contains("raspberry") || haystack.contains("pi-") || haystack.contains("b8:27:eb") || haystack.contains("dc:a6:32"))
         add("Apple device", if: haystack.contains("apple") || haystack.contains("macbook") || haystack.contains("iphone") || haystack.contains("ipad") || haystack.contains("watch"))
+        add("Mac / macOS candidate", if: haystack == "mac" || haystack.contains("macbook") || haystack.contains("imac") || haystack.contains("mac-mini") || haystack.contains("mac-studio") || haystack.contains("mac.lan") || haystack.contains("mac.local"))
         add("Apple TV / AirPlay candidate", if: haystack.contains("apple-tv") || haystack.contains("appletv") || haystack.contains("airplay") || haystack.contains("tv.local") || haystack.contains("tv.lan"))
         add("Samsung device", if: haystack.contains("samsung"))
         add("Samsung Smart TV candidate", if: haystack.contains("samsung") && (haystack.contains("tv") || haystack.contains("tizen") || haystack == "samsung"))
@@ -487,11 +564,61 @@ actor LANScanner {
         return hints
     }
 
+    private static func localFindings(for device: NetworkDevice) -> [DeviceInspectionItem] {
+        var findings: [DeviceInspectionItem] = [
+            DeviceInspectionItem(
+                name: "Last seen",
+                detail: DateFormatter.scannerTime.string(from: device.lastSeen),
+                port: nil,
+                systemImage: "clock"
+            )
+        ]
+
+        if let responseTimeMS = device.responseTimeMS {
+            findings.append(
+                DeviceInspectionItem(
+                    name: "Ping response",
+                    detail: String(format: "%.1f ms", responseTimeMS),
+                    port: nil,
+                    systemImage: "speedometer"
+                )
+            )
+        }
+
+        if let dnsName = device.dnsName,
+           !dnsName.isEmpty,
+           dnsName.localizedCaseInsensitiveCompare(device.displayName) != .orderedSame {
+            findings.append(
+                DeviceInspectionItem(
+                    name: "DNS name",
+                    detail: dnsName,
+                    port: nil,
+                    systemImage: "network"
+                )
+            )
+        }
+
+        if let macAddress = device.macAddress, Self.isLocallyAdministeredMAC(macAddress) {
+            findings.append(
+                DeviceInspectionItem(
+                    name: "MAC address type",
+                    detail: "Locally administered. Vendor and device type may be masked or randomized.",
+                    port: nil,
+                    systemImage: "person.crop.circle.badge.questionmark"
+                )
+            )
+        }
+
+        return findings
+    }
+
     private static func inspectionNotes(for device: NetworkDevice, likelyTypes: [String], services: [DeviceInspectionItem], systemFindings: [DeviceInspectionItem]) -> [String] {
         var notes: [String] = []
         let serviceNames = Set(services.map(\.name))
         let systemFindingNames = Set(systemFindings.map(\.name))
         let isRaspberryPi = likelyTypes.contains("Raspberry Pi")
+        let isVacuumCandidate = likelyTypes.contains("Vacuum / robot candidate")
+        let isMacCandidate = likelyTypes.contains("Mac / macOS candidate")
 
         if isRaspberryPi {
             if systemFindingNames.contains("SSH passwordless login") {
@@ -519,6 +646,18 @@ actor LANScanner {
             notes.append("MQTT is open. This is likely an IoT broker or smart-home integration point.")
         }
 
+        if serviceNames.contains("Miio / robot vacuum") {
+            notes.append("Miio-style local control port detected. Roborock/Xiaomi vacuum is likely.")
+        }
+
+        if serviceNames.contains("Robot vacuum cloud bridge") {
+            notes.append("Robot-vacuum vendor/cloud helper port detected.")
+        }
+
+        if isVacuumCandidate, !serviceNames.contains("Miio / robot vacuum"), !serviceNames.contains("Robot vacuum cloud bridge") {
+            notes.append("Roborock/vacuum hostname detected. These devices often expose little or nothing over TCP while idle; more detail usually needs the vendor token/cloud integration or Home Assistant.")
+        }
+
         let appleTVServices = ["RAOP / AirTunes", "Apple TV MediaRemote", "Apple TV Companion", "AirPlay", "AirPlay control", "AirPlay alt", "HomeKit accessory"]
         let hasAppleTVService = appleTVServices.contains { serviceNames.contains($0) }
         let isAppleTVCandidate = likelyTypes.contains("Apple TV / AirPlay candidate")
@@ -541,6 +680,14 @@ actor LANScanner {
 
         if isAppleTVCandidate, !hasAppleTVService {
             notes.append("Apple TV/AirPlay candidate, but no Apple TV control ports answered. It may be asleep, on another interface, or only advertising through Bonjour.")
+        }
+
+        if isMacCandidate {
+            if serviceNames.contains("SMB") || serviceNames.contains("AFP") || serviceNames.contains("AirDrop / AWDL") {
+                notes.append("Mac/macOS candidate with Apple/macOS sharing-style ports visible.")
+            } else {
+                notes.append("Mac/macOS candidate. Modern Macs often expose little over TCP unless Sharing, AirDrop or Remote Login is enabled.")
+            }
         }
 
         if serviceNames.contains("Google Cast") {
@@ -599,18 +746,26 @@ actor LANScanner {
             notes.append("Media server endpoint detected.")
         }
 
-        if let macAddress = device.macAddress,
-           let firstByte = macAddress.split(separator: ":").first,
-           let value = UInt8(firstByte, radix: 16),
-           value & 2 == 2 {
+        if let macAddress = device.macAddress, Self.isLocallyAdministeredMAC(macAddress) {
             notes.append("MAC is locally administered, so vendor and device-type guesses can be masked or randomized.")
         }
 
-        if services.isEmpty, !isSamsungDevice, !isAppleTVCandidate {
+        if services.isEmpty, !isSamsungDevice, !isAppleTVCandidate, !isVacuumCandidate, !isMacCandidate {
             notes.append("No known inspected ports responded. It may still be a phone, watch, TV, sensor, vacuum or sleeping device.")
         }
 
         return notes
+    }
+
+    private static func isLocallyAdministeredMAC(_ macAddress: String) -> Bool {
+        guard
+            let firstByte = macAddress.split(separator: ":").first,
+            let value = UInt8(firstByte, radix: 16)
+        else {
+            return false
+        }
+
+        return value & 2 == 2
     }
 
     static func localNetwork() -> LocalNetwork? {

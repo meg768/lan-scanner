@@ -18,12 +18,26 @@ enum AppAppearanceMode: String {
     }
 }
 
-enum AppSurfaceTheme: String {
+enum AppSurfaceTheme: String, Identifiable {
     case hard
     case grass
     case clay
 
     static let cycle: [AppSurfaceTheme] = [.hard, .grass, .clay]
+    static let pickerOrder: [AppSurfaceTheme] = [.clay, .grass, .hard]
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .clay:
+            return "Roland Garros"
+        case .grass:
+            return "Wimbledon"
+        case .hard:
+            return "US Open"
+        }
+    }
 }
 
 final class AppearanceSettings: ObservableObject {

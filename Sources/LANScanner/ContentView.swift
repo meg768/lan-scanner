@@ -6,18 +6,15 @@ struct ContentView: View {
     @EnvironmentObject private var appearance: AppearanceSettings
     @StateObject private var store = ScannerStore()
     @State private var searchText = ""
-    @State private var sortColumn: DeviceSortColumn = .ipAddress
+    @State private var sortColumn: DeviceSortColumn = .name
     @State private var sortAscending = true
+    @State private var isSettingsPresented = false
 
     var body: some View {
         VStack(spacing: 8) {
             HeaderPanel(
                 network: store.localNetwork,
-                isScanning: store.isScanning,
-                isScanDisabled: store.isBusy,
-                isResetDisabled: store.isBusy || store.devices.isEmpty,
-                onScan: store.scan,
-                onReset: store.resetDevices
+                isScanning: store.isScanning
             )
 
             DeviceListPanel(
@@ -36,34 +33,33 @@ struct ContentView: View {
         .toolbar {
             ToolbarItemGroup {
                 Button {
-                    appearance.cycleSurface()
-                } label: {
-                    Label("Theme", systemImage: "slider.horizontal.3")
-                }
-
-                Button {
                     store.scan()
                 } label: {
-                    Label("Scan", systemImage: "dot.radiowaves.left.and.right")
+                    Label("Rescan", systemImage: "arrow.clockwise")
                 }
                 .disabled(store.isBusy)
 
                 Button {
-                    store.resetDevices()
+                    isSettingsPresented = true
                 } label: {
-                    Label("Clear", systemImage: "trash")
+                    Label("Settings", systemImage: "gearshape")
                 }
-                .disabled(store.devices.isEmpty)
             }
         }
+        .sheet(isPresented: $isSettingsPresented) {
+            ThemeSettingsDialog(selectedTheme: $appearance.surface)
+        }
         .onAppear {
-            store.refreshLocalNetwork()
+            store.startAutoScan()
+        }
+        .onDisappear {
+            store.stopAutoScan()
         }
         .modifier(FunctionKeyShortcut(keyCode: 97, functionKey: NSF6FunctionKey) {
             appearance.toggle(over: colorScheme)
         })
         .modifier(FunctionKeyShortcut(keyCode: 99, functionKey: NSF3FunctionKey) {
-            appearance.cycleSurface()
+            isSettingsPresented = true
         })
     }
 
@@ -94,23 +90,23 @@ struct ContentView: View {
 
 enum DeviceSortColumn {
     case name
-    case ipAddress
-    case macAddress
+    case address
     case vendor
-    case dnsName
+    case ping
+    case lastSeen
 
     var title: String {
         switch self {
         case .name:
             return "Name"
-        case .ipAddress:
-            return "IP"
-        case .macAddress:
-            return "MAC"
+        case .address:
+            return "Address"
         case .vendor:
             return "Vendor"
-        case .dnsName:
-            return "DNS Name"
+        case .ping:
+            return "Ping"
+        case .lastSeen:
+            return "Seen"
         }
     }
 }
@@ -122,14 +118,14 @@ enum DeviceSortComparator {
         switch column {
         case .name:
             result = compareText(lhs.displayName, rhs.displayName)
-        case .ipAddress:
+        case .address:
             result = compareText(lhs.tableIPSortKey, rhs.tableIPSortKey)
-        case .macAddress:
-            result = compareText(lhs.tableMACAddress, rhs.tableMACAddress)
         case .vendor:
             result = compareText(lhs.tableVendor, rhs.tableVendor)
-        case .dnsName:
-            result = compareText(lhs.tableDNSName, rhs.tableDNSName)
+        case .ping:
+            result = compareOptionalDouble(lhs.responseTimeMS, rhs.responseTimeMS)
+        case .lastSeen:
+            result = compareDate(lhs.lastSeen, rhs.lastSeen)
         }
 
         if result == .orderedSame {
@@ -151,6 +147,31 @@ enum DeviceSortComparator {
             return lhs.localizedStandardCompare(rhs)
         }
     }
+
+    private static func compareOptionalDouble(_ lhs: Double?, _ rhs: Double?) -> ComparisonResult {
+        switch (lhs, rhs) {
+        case (nil, nil):
+            return .orderedSame
+        case (nil, _):
+            return .orderedDescending
+        case (_, nil):
+            return .orderedAscending
+        case (let lhs?, let rhs?):
+            if lhs == rhs {
+                return .orderedSame
+            }
+
+            return lhs < rhs ? .orderedAscending : .orderedDescending
+        }
+    }
+
+    private static func compareDate(_ lhs: Date, _ rhs: Date) -> ComparisonResult {
+        if lhs == rhs {
+            return .orderedSame
+        }
+
+        return lhs < rhs ? .orderedAscending : .orderedDescending
+    }
 }
 
 @MainActor
@@ -162,17 +183,43 @@ final class ScannerStore: ObservableObject {
     @Published var isBusy = false
 
     private let scanner = LANScanner()
+    private var autoScanTask: Task<Void, Never>?
+    private let autoScanInterval: UInt64 = 120_000_000_000
 
     func refreshLocalNetwork() {
         localNetwork = LANScanner.localNetwork()
     }
 
-    func resetDevices() {
-        devices = []
-        status = .idle
+    func scan() {
+        Task {
+            await scanOnce()
+        }
     }
 
-    func scan() {
+    func startAutoScan() {
+        guard autoScanTask == nil else {
+            return
+        }
+
+        refreshLocalNetwork()
+        autoScanTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                guard let self else {
+                    return
+                }
+
+                await self.scanOnce()
+                try? await Task.sleep(nanoseconds: self.autoScanInterval)
+            }
+        }
+    }
+
+    func stopAutoScan() {
+        autoScanTask?.cancel()
+        autoScanTask = nil
+    }
+
+    private func scanOnce() async {
         guard !isBusy else {
             return
         }
@@ -182,23 +229,21 @@ final class ScannerStore: ObservableObject {
         status = .scanning("Scanning local network...")
         refreshLocalNetwork()
 
-        Task {
-            do {
-                let foundDevices = try await scanner.scan { completed, total in
-                    Task { @MainActor in
-                        self.status = .scanning("Scanned \(completed) of \(total) addresses...")
-                    }
+        do {
+            let foundDevices = try await scanner.scan { completed, total in
+                Task { @MainActor in
+                    self.status = .scanning("Scanned \(completed) of \(total) addresses...")
                 }
-
-                mergeDevices(foundDevices)
-                isScanning = false
-                status = .complete("Updated \(foundDevices.count) devices. \(devices.count) listed.")
-                isBusy = false
-            } catch {
-                status = .failed(error.localizedDescription)
-                isScanning = false
-                isBusy = false
             }
+
+            mergeDevices(foundDevices)
+            isScanning = false
+            status = .complete("Updated \(foundDevices.count) devices. \(devices.count) listed.")
+            isBusy = false
+        } catch {
+            status = .failed(error.localizedDescription)
+            isScanning = false
+            isBusy = false
         }
     }
 
@@ -230,10 +275,6 @@ final class ScannerStore: ObservableObject {
 struct HeaderPanel: View {
     let network: LocalNetwork?
     let isScanning: Bool
-    let isScanDisabled: Bool
-    let isResetDisabled: Bool
-    let onScan: () -> Void
-    let onReset: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -242,21 +283,9 @@ struct HeaderPanel: View {
                     HStack(spacing: 8) {
                         ScannerLabel()
 
-                        Button {
-                            onScan()
-                        } label: {
-                            PillLabel(isScanning ? "Scanning" : "Scan")
+                        if isScanning {
+                            PillLabel("Scanning...")
                         }
-                        .buttonStyle(.plain)
-                        .disabled(isScanDisabled)
-
-                        Button {
-                            onReset()
-                        } label: {
-                            PillLabel("Clear", isActive: false)
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(isResetDisabled)
                     }
 
                     Text(network?.displayName ?? "No local IPv4 network")
@@ -431,12 +460,17 @@ struct DeviceTableHeader: View {
     @Binding var sortAscending: Bool
 
     var body: some View {
-        LazyVGrid(columns: DeviceTableColumns.columns, spacing: 0) {
+        HStack(spacing: 6) {
             DeviceHeaderCell(column: .name, sortColumn: $sortColumn, sortAscending: $sortAscending)
-            DeviceHeaderCell(column: .ipAddress, sortColumn: $sortColumn, sortAscending: $sortAscending)
-            DeviceHeaderCell(column: .macAddress, sortColumn: $sortColumn, sortAscending: $sortAscending)
+                .frame(minWidth: DeviceTableColumns.nameMinWidth, maxWidth: .infinity, alignment: .leading)
+            DeviceHeaderCell(column: .address, sortColumn: $sortColumn, sortAscending: $sortAscending)
+                .frame(width: DeviceTableColumns.addressWidth, alignment: .leading)
             DeviceHeaderCell(column: .vendor, sortColumn: $sortColumn, sortAscending: $sortAscending)
-            DeviceHeaderCell(column: .dnsName, sortColumn: $sortColumn, sortAscending: $sortAscending)
+                .frame(minWidth: DeviceTableColumns.vendorMinWidth, maxWidth: .infinity, alignment: .leading)
+            DeviceHeaderCell(column: .ping, sortColumn: $sortColumn, sortAscending: $sortAscending)
+                .frame(width: DeviceTableColumns.pingWidth, alignment: .leading)
+            DeviceHeaderCell(column: .lastSeen, sortColumn: $sortColumn, sortAscending: $sortAscending)
+                .frame(width: DeviceTableColumns.seenWidth, alignment: .leading)
         }
         .padding(.horizontal, 12)
         .padding(.top, 2)
@@ -452,14 +486,11 @@ struct DeviceTableHeader: View {
 
 enum DeviceTableColumns {
     static let scrollbarGutter: CGFloat = 16
-
-    static let columns: [GridItem] = [
-        GridItem(.flexible(minimum: 260), spacing: 6, alignment: .leading),
-        GridItem(.flexible(minimum: 150, maximum: 190), spacing: 6, alignment: .leading),
-        GridItem(.flexible(minimum: 190, maximum: 240), spacing: 6, alignment: .leading),
-        GridItem(.flexible(minimum: 220), spacing: 6, alignment: .leading),
-        GridItem(.flexible(minimum: 260), spacing: 0, alignment: .leading)
-    ]
+    static let nameMinWidth: CGFloat = 250
+    static let addressWidth: CGFloat = 350
+    static let vendorMinWidth: CGFloat = 220
+    static let pingWidth: CGFloat = 90
+    static let seenWidth: CGFloat = 96
 }
 
 struct DeviceHeaderCell: View {
@@ -526,7 +557,7 @@ struct DeviceTableRow: View {
     let onInfo: () -> Void
 
     var body: some View {
-        LazyVGrid(columns: DeviceTableColumns.columns, spacing: 0) {
+        HStack(spacing: 6) {
             DeviceTableCell(isPrimary: true) {
                 HStack(spacing: 9) {
                     Button(action: onInfo) {
@@ -542,11 +573,16 @@ struct DeviceTableRow: View {
                         .lineLimit(1)
                 }
             }
+            .frame(minWidth: DeviceTableColumns.nameMinWidth, maxWidth: .infinity, alignment: .leading)
 
-            DeviceTableCell(isMonospaced: true) { Text(device.ipAddress) }
-            DeviceTableCell(isMonospaced: true) { Text(device.macAddress ?? "-") }
+            DeviceTableCell(isMonospaced: true) { Text(device.addressText) }
+                .frame(width: DeviceTableColumns.addressWidth, alignment: .leading)
             DeviceTableCell { Text(device.vendor ?? "-") }
-            DeviceTableCell { Text(device.dnsName ?? "-") }
+                .frame(minWidth: DeviceTableColumns.vendorMinWidth, maxWidth: .infinity, alignment: .leading)
+            DeviceTableCell(isMonospaced: true) { Text(device.pingText) }
+                .frame(width: DeviceTableColumns.pingWidth, alignment: .leading)
+            DeviceTableCell(isMonospaced: true) { Text(DateFormatter.scannerTime.string(from: device.lastSeen)) }
+                .frame(width: DeviceTableColumns.seenWidth, alignment: .leading)
         }
         .padding(.horizontal, 12)
         .frame(height: 34)
@@ -680,6 +716,132 @@ struct DeviceInfoDialog: View {
             }
         } else {
             DeviceInspectionMessage(text: "No open known services found. Only local device data is available.", systemImage: "checkmark.circle")
+        }
+    }
+}
+
+struct ThemeSettingsDialog: View {
+    @Environment(\.dismiss) private var dismiss
+    @Binding var selectedTheme: AppSurfaceTheme
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(spacing: 10) {
+                Image(systemName: "gearshape.fill")
+                    .font(.system(size: 23, weight: .semibold))
+                    .foregroundStyle(AppColors.primaryStrong)
+
+                Text("Settings")
+                    .font(.system(size: 20, weight: .bold))
+                    .foregroundStyle(AppColors.heading)
+
+                Spacer()
+            }
+
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Theme")
+                    .font(.caption)
+                    .fontWeight(.bold)
+                    .textCase(.uppercase)
+                    .foregroundStyle(AppColors.caption)
+
+                VStack(spacing: 8) {
+                    ForEach(AppSurfaceTheme.pickerOrder) { theme in
+                        ThemeChoiceRow(
+                            theme: theme,
+                            isSelected: selectedTheme == theme
+                        ) {
+                            selectedTheme = theme
+                        }
+                    }
+                }
+            }
+
+            HStack {
+                Spacer()
+                Button("Done") {
+                    dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(22)
+        .frame(width: 380)
+        .background(AppColors.panelBackground)
+    }
+}
+
+struct ThemeChoiceRow: View {
+    let theme: AppSurfaceTheme
+    let isSelected: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 11) {
+                ThemeSwatch(theme: theme)
+                    .frame(width: 34, height: 24)
+
+                Text(theme.displayName)
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundStyle(isSelected ? AppColors.primaryStrong : AppColors.heading)
+
+                Spacer()
+
+                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(isSelected ? AppColors.primaryStrong : AppColors.badgeText)
+            }
+            .padding(.horizontal, 12)
+            .frame(height: 44)
+            .background(isSelected ? AppColors.badgeBackground : AppColors.tableRowBackground)
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .overlay {
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(isSelected ? AppColors.primary.opacity(0.65) : AppColors.panelBorder, lineWidth: 1)
+            }
+            .contentShape(RoundedRectangle(cornerRadius: 8))
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+struct ThemeSwatch: View {
+    let theme: AppSurfaceTheme
+
+    var body: some View {
+        HStack(spacing: 0) {
+            swatchColors.0
+            swatchColors.1
+            swatchColors.2
+        }
+        .clipShape(Capsule())
+        .overlay {
+            Capsule()
+                .stroke(AppColors.panelBorder, lineWidth: 1)
+        }
+    }
+
+    private var swatchColors: (Color, Color, Color) {
+        switch theme {
+        case .clay:
+            return (
+                Color(nsColor: AppColors.nsColor(0.58, 0.31, 0.24)),
+                Color(nsColor: AppColors.nsColor(0.85, 0.42, 0.28)),
+                Color(nsColor: AppColors.nsColor(0.96, 0.84, 0.78))
+            )
+        case .grass:
+            return (
+                Color(nsColor: AppColors.nsColor(0.08, 0.52, 0.36)),
+                Color(nsColor: AppColors.nsColor(0.18, 0.74, 0.51)),
+                Color(nsColor: AppColors.nsColor(0.78, 0.92, 0.85))
+            )
+        case .hard:
+            return (
+                Color(nsColor: AppColors.nsColor(0.02, 0.19, 0.36)),
+                Color(nsColor: AppColors.nsColor(0.08, 0.36, 0.62)),
+                Color(nsColor: AppColors.nsColor(0.79, 0.88, 0.96))
+            )
         }
     }
 }
