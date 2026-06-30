@@ -42,6 +42,13 @@ Do not present `xattr -dr com.apple.quarantine` as an acceptable non-technical u
 
 When checked on 2026-06-30, `security find-identity -v -p codesigning` returned `0 valid identities found`, so this Mac could not produce a real Developer ID-notarized release.
 
+## Visual Design
+
+`LAN Scanner` and `/Users/magnus/Documents/GitHub/broker-explorer` are sister
+tools. Keep their `hard`, `grass`, and `clay` themes visually synchronized:
+same RGB palette, same 8px panel radius, same panel border treatment, and the
+same tennis-surface theme naming (`US Open`, `Wimbledon`, `Roland Garros`).
+
 ## Gotchas
 
 - `dmgbuild` and simple `hdiutil create -srcfolder` flows caused Finder metadata / extended attributes on the `.app` inside the DMG, which broke strict code-sign verification with errors like `resource fork, Finder information, or similar detritus not allowed`.

@@ -44,6 +44,7 @@ fi
 chmod +x "${MACOS_DIR}/${EXECUTABLE_NAME}"
 
 xattr -cr "${APP_DIR}"
+xattr -d com.apple.FinderInfo "${APP_DIR}" 2>/dev/null || true
 codesign --force --deep --sign - "${APP_DIR}"
 codesign --verify --deep --strict --verbose=2 "${APP_DIR}"
 

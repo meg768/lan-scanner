@@ -59,7 +59,7 @@ struct ContentView: View {
             appearance.toggle(over: colorScheme)
         })
         .modifier(FunctionKeyShortcut(keyCode: 99, functionKey: NSF3FunctionKey) {
-            isSettingsPresented = true
+            appearance.cycleSurface()
         })
     }
 
