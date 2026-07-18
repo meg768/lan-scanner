@@ -222,30 +222,29 @@ actor LANScanner {
         let users = Self.sshUsers()
         var findings: [DeviceInspectionItem] = []
 
-        for user in users {
-            let result = await Self.run(
-                "/usr/bin/ssh",
-                arguments: Self.sshArguments(user: user, host: device.ipAddress),
-                timeout: 20
-            )
+        await withTaskGroup(of: [DeviceInspectionItem].self) { group in
+            for user in users {
+                group.addTask {
+                    let result = await Self.run(
+                        "/usr/bin/ssh",
+                        arguments: Self.sshArguments(user: user, host: device.ipAddress),
+                        timeout: 20
+                    )
 
-            if result.exitCode == 0 {
-                findings.append(contentsOf: Self.sshFindings(from: result.output, user: user))
+                    guard result.exitCode == 0 else {
+                        return []
+                    }
+
+                    return Self.sshFindings(from: result.output, user: user)
+                }
+            }
+
+            for await userFindings in group {
+                findings.append(contentsOf: userFindings)
             }
         }
 
-        if !findings.isEmpty {
-            return Self.deduplicatedFindings(findings)
-        }
-
-        return [
-            DeviceInspectionItem(
-                name: "SSH passwordless login failed",
-                detail: "SSH is open, but passwordless public-key login failed for \(users.joined(separator: ", ")).",
-                port: nil,
-                systemImage: "key.slash"
-            )
-        ]
+        return Self.deduplicatedFindings(findings)
     }
 
     private static func deduplicatedFindings(_ findings: [DeviceInspectionItem]) -> [DeviceInspectionItem] {
@@ -380,7 +379,7 @@ actor LANScanner {
             "-o", "PreferredAuthentications=publickey",
             "-o", "PasswordAuthentication=no",
             "-o", "KbdInteractiveAuthentication=no",
-            "-o", "ConnectTimeout=10",
+            "-o", "ConnectTimeout=4",
             "-o", "StrictHostKeyChecking=accept-new",
             "\(user)@\(host)",
             sshInspectionScript
@@ -392,9 +391,20 @@ actor LANScanner {
     kv SSH_USER "$(id -un 2>/dev/null)"; \
     kv HOSTNAME "$(hostname 2>/dev/null)"; \
     kv OS "$(sh -c ". /etc/os-release 2>/dev/null && printf %s \\"$PRETTY_NAME\\"" 2>/dev/null)"; \
+    kv PI_MODEL "$(tr -d "\\000" </sys/firmware/devicetree/base/model 2>/dev/null)"; \
     kv KERNEL "$(uname -srmo 2>/dev/null)"; \
     kv UPTIME "$(uptime -p 2>/dev/null)"; \
     kv ARCH "$(uname -m 2>/dev/null)"; \
+    kv HARDWARE_MODEL "$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | awk "NF" | paste -sd " " -)"; \
+    kv MACOS "$(command -v sw_vers >/dev/null 2>&1 && { sw_vers -productName 2>/dev/null; sw_vers -productVersion 2>/dev/null; } | paste -sd " " -)"; \
+    kv SYNOLOGY "$(test -r /etc/synoinfo.conf && grep -m1 "^upnpmodelname=" /etc/synoinfo.conf 2>/dev/null | cut -d= -f2 | tr -d "\\\"")"; \
+    kv QNAP "$(test -r /etc/config/uLinux.conf && grep -m1 "^Model =" /etc/config/uLinux.conf 2>/dev/null | cut -d= -f2- | xargs)"; \
+    kv OPENWRT "$(test -r /etc/openwrt_release && grep -m1 "^DISTRIB_DESCRIPTION=" /etc/openwrt_release 2>/dev/null | cut -d= -f2- | tr -d "\\\"")"; \
+    kv PROXMOX "$(command -v pveversion >/dev/null 2>&1 && timeout 2 pveversion 2>/dev/null)"; \
+    kv HOME_ASSISTANT "$(if command -v ha >/dev/null 2>&1 || test -d /usr/share/hassio || test -d /mnt/data/supervisor; then printf "Home Assistant host"; fi)"; \
+    kv VIRTUALIZATION "$(command -v systemd-detect-virt >/dev/null 2>&1 && timeout 2 systemd-detect-virt 2>/dev/null | grep -v "^none$")"; \
+    kv TEMPERATURE "$(if command -v vcgencmd >/dev/null 2>&1; then vcgencmd measure_temp 2>/dev/null | sed "s/^temp=//"; elif test -r /sys/class/thermal/thermal_zone0/temp; then awk "{printf \"%.1f C\", \\$1/1000}" /sys/class/thermal/thermal_zone0/temp 2>/dev/null; fi)"; \
+    kv GIT "$(command -v git >/dev/null 2>&1 && timeout 2 git --version 2>/dev/null)"; \
     kv NODE "$(command -v node >/dev/null 2>&1 && timeout 2 node --version 2>/dev/null)"; \
     kv NPM "$(command -v npm >/dev/null 2>&1 && timeout 2 npm --version 2>/dev/null)"; \
     kv PYTHON3 "$(command -v python3 >/dev/null 2>&1 && timeout 2 python3 --version 2>/dev/null)"; \
@@ -413,11 +423,13 @@ actor LANScanner {
     kv JAVA "$(command -v java >/dev/null 2>&1 && java -version 2>&1 | head -1)"; \
     kv GO "$(command -v go >/dev/null 2>&1 && timeout 2 go version 2>/dev/null)"; \
     kv RUST "$(command -v rustc >/dev/null 2>&1 && timeout 2 rustc --version 2>/dev/null)"; \
+    kv CPU_LOAD "$(if command -v vmstat >/dev/null 2>&1; then LC_ALL=C vmstat 1 2 2>/dev/null | tail -1 | awk "{printf \"%.0f%%\", 100-\\$15}"; else LC_ALL=C top -bn1 2>/dev/null | awk "/^%?Cpu/{printf \"%.0f%%\", 100-\\$8; exit}"; fi)"; \
     kv DISK_ROOT "$(df -h / 2>/dev/null | awk "NR==2{print \\$3 \\" used of \\" \\$2 \\" (\\" \\$5 \\")\\"}")"; \
     kv MEMORY "$(free -h 2>/dev/null | awk "/^Mem:/{print \\$3 \\" used of \\" \\$2}")"; \
+    kv MEMORY_PERCENT "$(free -b 2>/dev/null | awk "/^Mem:/{printf \"%.0f%%\", \\$3/\\$2*100}")"; \
     kv SYSTEMD_MATCHES "$(command -v systemctl >/dev/null 2>&1 && timeout 3 systemctl list-units --type=service --state=running --no-pager --no-legend 2>/dev/null | awk "{print \\$1}" | grep -Ei "node|pm2|docker|nginx|apache|mysql|mariadb|postgres|redis|mosquitto|home|assistant|nodered|grafana|influx|prometheus" | head -20 | paste -sd "," -)"; \
     kv PROCESS_MATCHES "$(ps -eo comm= 2>/dev/null | grep -Ei "node|python|pm2|docker|nginx|apache|mysql|mariadb|postgres|redis|mosquitto|home|assistant|nodered|grafana|influx|prometheus|java|mqtt|zigbee|zwave" | sort -u | head -30 | paste -sd "," -)"; \
-    kv TOP_CPU "$(ps -eo pcpu,comm --sort=-pcpu 2>/dev/null | awk "NR>1 && \\$1+0>0 {print \\$2 \\" \\" \\$1 \\"%\\"}" | head -8 | paste -sd "," -)"; \
+    kv TOP_CPU "$(ps -eo pcpu,comm --sort=-pcpu 2>/dev/null | awk "NR>1 && \\$1+0>0 && \\$2 !~ /^(sshd|ssh|sh|ps|top|vmstat|awk|grep|head|tail|paste|sort|timeout)$/ {print \\$2 \\" \\" \\$1 \\"%\\"}" | head -8 | paste -sd "," -)"; \
     kv TOP_MEM "$(ps -eo pmem,comm --sort=-pmem 2>/dev/null | awk "NR>1 && \\$1+0>0 {print \\$2 \\" \\" \\$1 \\"%\\"}" | head -8 | paste -sd "," -)"; \
     kv HOME_DIRS "$(find /home -mindepth 1 -maxdepth 1 -type d -printf "%f " 2>/dev/null)"'
     """
@@ -444,14 +456,32 @@ actor LANScanner {
 
         func add(_ key: String, name: String, icon: String) {
             if let value = values[key] {
-                findings.append(DeviceInspectionItem(name: name, detail: value, port: nil, systemImage: icon))
+                let percentageText = key == "MEMORY" ? values["MEMORY_PERCENT"] : value
+                let progress = percentageText.flatMap(Self.percentageProgress)
+                    ?? (key == "MEMORY" ? Self.usageProgress(from: value) : nil)
+                var detail = value
+                if key == "MEMORY", let progress {
+                    detail += " (\(Int((progress * 100).rounded()))%)"
+                }
+                findings.append(DeviceInspectionItem(name: name, detail: detail, port: nil, systemImage: icon, progress: progress))
             }
         }
 
         add("OS", name: "Operating system", icon: "desktopcomputer")
+        add("PI_MODEL", name: "Raspberry Pi model", icon: "cpu")
         add("KERNEL", name: "Kernel", icon: "cpu")
         add("UPTIME", name: "Uptime", icon: "clock")
         add("ARCH", name: "Architecture", icon: "memorychip")
+        add("HARDWARE_MODEL", name: "Hardware model", icon: "desktopcomputer")
+        add("MACOS", name: "macOS", icon: "apple.logo")
+        add("SYNOLOGY", name: "Synology NAS", icon: "externaldrive.connected.to.line.below")
+        add("QNAP", name: "QNAP NAS", icon: "externaldrive.connected.to.line.below")
+        add("OPENWRT", name: "OpenWrt", icon: "wifi.router")
+        add("PROXMOX", name: "Proxmox", icon: "square.stack.3d.up")
+        add("HOME_ASSISTANT", name: "Home Assistant", icon: "house")
+        add("VIRTUALIZATION", name: "Virtualization", icon: "square.stack.3d.up")
+        add("TEMPERATURE", name: "Temperature", icon: "thermometer.medium")
+        add("GIT", name: "Git", icon: "point.3.connected.trianglepath.dotted")
         add("NODE", name: "Node.js", icon: "hexagon")
         add("NPM", name: "npm", icon: "shippingbox")
         add("PYTHON3", name: "Python 3", icon: "chevron.left.forwardslash.chevron.right")
@@ -470,6 +500,7 @@ actor LANScanner {
         add("JAVA", name: "Java", icon: "cup.and.saucer")
         add("GO", name: "Go", icon: "chevron.left.forwardslash.chevron.right")
         add("RUST", name: "Rust", icon: "gearshape.2")
+        add("CPU_LOAD", name: "CPU load", icon: "cpu")
         add("SYSTEMD_MATCHES", name: "Running services", icon: "list.bullet.rectangle")
         add("PROCESS_MATCHES", name: "Interesting processes", icon: "waveform.path.ecg.rectangle")
         add("TOP_CPU", name: "Top CPU processes", icon: "speedometer")
@@ -479,6 +510,53 @@ actor LANScanner {
         add("HOME_DIRS", name: "Home directories", icon: "house")
 
         return findings
+    }
+
+    private static func percentageProgress(from text: String) -> Double? {
+        guard let range = text.range(of: #"[0-9]+(?:\.[0-9]+)?%"#, options: .regularExpression) else {
+            return nil
+        }
+
+        let percentage = text[range].dropLast()
+        guard let value = Double(percentage) else {
+            return nil
+        }
+
+        return min(max(value / 100, 0), 1)
+    }
+
+    private static func usageProgress(from text: String) -> Double? {
+        let pattern = #"([0-9.]+)\s*([KMGT]?i?B?)\s+used of\s+([0-9.]+)\s*([KMGT]?i?B?)"#
+        guard
+            let expression = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive),
+            let match = expression.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+            let usedRange = Range(match.range(at: 1), in: text),
+            let usedUnitRange = Range(match.range(at: 2), in: text),
+            let totalRange = Range(match.range(at: 3), in: text),
+            let totalUnitRange = Range(match.range(at: 4), in: text),
+            let used = Double(text[usedRange]),
+            let total = Double(text[totalRange])
+        else {
+            return nil
+        }
+
+        let usedBytes = used * unitMultiplier(String(text[usedUnitRange]))
+        let totalBytes = total * unitMultiplier(String(text[totalUnitRange]))
+        guard totalBytes > 0 else {
+            return nil
+        }
+
+        return min(max(usedBytes / totalBytes, 0), 1)
+    }
+
+    private static func unitMultiplier(_ unit: String) -> Double {
+        switch unit.uppercased().first {
+        case "K": return 1_024
+        case "M": return 1_048_576
+        case "G": return 1_073_741_824
+        case "T": return 1_099_511_627_776
+        default: return 1
+        }
     }
 
     private static func isUsefulSSHValue(_ value: String) -> Bool {
@@ -624,7 +702,7 @@ actor LANScanner {
             if systemFindingNames.contains("SSH passwordless login") {
                 notes.append("Raspberry Pi SSH inspection succeeded. Installed runtimes and services above came from the device itself.")
             } else if serviceNames.contains("SSH") {
-                notes.append("Raspberry Pi with SSH open, but passwordless public-key login did not succeed for pi or root.")
+                notes.append("SSH is available. Configure passwordless access for pi or root to include system details.")
             } else {
                 notes.append("Raspberry Pi candidate, but SSH is not open on port 22.")
             }

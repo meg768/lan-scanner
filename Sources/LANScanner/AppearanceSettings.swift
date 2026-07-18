@@ -115,6 +115,7 @@ struct FunctionKeyShortcut: ViewModifier {
 
 enum SettingsStore {
     private static let surfaceThemeKey = "ui.surfaceTheme"
+    private static let inspectorPanelWidthKey = "ui.inspectorPanelWidth"
 
     static func loadSurfaceTheme() -> AppSurfaceTheme {
         guard
@@ -129,5 +130,23 @@ enum SettingsStore {
 
     static func save(surfaceTheme: AppSurfaceTheme) {
         UserDefaults.standard.set(surfaceTheme.rawValue, forKey: surfaceThemeKey)
+    }
+
+    static func loadInspectorPanelWidth() -> CGFloat? {
+        guard UserDefaults.standard.object(forKey: inspectorPanelWidthKey) != nil else {
+            return nil
+        }
+
+        let width = UserDefaults.standard.double(forKey: inspectorPanelWidthKey)
+        return width > 0 ? CGFloat(width) : nil
+    }
+
+    static func save(inspectorPanelWidth: CGFloat?) {
+        guard let inspectorPanelWidth else {
+            UserDefaults.standard.removeObject(forKey: inspectorPanelWidthKey)
+            return
+        }
+
+        UserDefaults.standard.set(Double(inspectorPanelWidth), forKey: inspectorPanelWidthKey)
     }
 }

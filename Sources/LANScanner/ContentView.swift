@@ -14,7 +14,9 @@ struct ContentView: View {
         VStack(spacing: 0) {
             HeaderPanel(
                 network: store.localNetwork,
-                isScanning: store.isScanning
+                isScanning: store.isScanning,
+                progress: store.isScanning ? store.scanProgress : store.autoScanProgress,
+                onScan: store.scan
             )
 
             DeviceListPanel(
@@ -93,7 +95,6 @@ enum DeviceSortColumn {
     case address
     case vendor
     case ping
-    case lastSeen
 
     var title: String {
         switch self {
@@ -105,8 +106,6 @@ enum DeviceSortColumn {
             return "Vendor"
         case .ping:
             return "Ping"
-        case .lastSeen:
-            return "Seen"
         }
     }
 }
@@ -124,8 +123,6 @@ enum DeviceSortComparator {
             result = compareText(lhs.tableVendor, rhs.tableVendor)
         case .ping:
             result = compareOptionalDouble(lhs.responseTimeMS, rhs.responseTimeMS)
-        case .lastSeen:
-            result = compareDate(lhs.lastSeen, rhs.lastSeen)
         }
 
         if result == .orderedSame {
@@ -165,13 +162,6 @@ enum DeviceSortComparator {
         }
     }
 
-    private static func compareDate(_ lhs: Date, _ rhs: Date) -> ComparisonResult {
-        if lhs == rhs {
-            return .orderedSame
-        }
-
-        return lhs < rhs ? .orderedAscending : .orderedDescending
-    }
 }
 
 @MainActor
@@ -181,10 +171,13 @@ final class ScannerStore: ObservableObject {
     @Published var status: ScanStatus = .idle
     @Published var isScanning = false
     @Published var isBusy = false
+    @Published var scanProgress = 0.0
+    @Published var autoScanProgress = 0.0
 
     private let scanner = LANScanner()
     private var autoScanTask: Task<Void, Never>?
-    private let autoScanInterval: UInt64 = 120_000_000_000
+    private let autoScanIntervalSeconds = 60.0
+    private let autoScanTickNanoseconds: UInt64 = 250_000_000
 
     func refreshLocalNetwork() {
         localNetwork = LANScanner.localNetwork()
@@ -209,7 +202,19 @@ final class ScannerStore: ObservableObject {
                 }
 
                 await self.scanOnce()
-                try? await Task.sleep(nanoseconds: self.autoScanInterval)
+                self.autoScanProgress = 0
+
+                let tickSeconds = Double(self.autoScanTickNanoseconds) / 1_000_000_000
+                let tickCount = Int(self.autoScanIntervalSeconds / tickSeconds)
+
+                for tick in 0..<tickCount {
+                    guard !Task.isCancelled else {
+                        return
+                    }
+
+                    self.autoScanProgress = Double(tick + 1) / Double(tickCount)
+                    try? await Task.sleep(nanoseconds: self.autoScanTickNanoseconds)
+                }
             }
         }
     }
@@ -217,6 +222,7 @@ final class ScannerStore: ObservableObject {
     func stopAutoScan() {
         autoScanTask?.cancel()
         autoScanTask = nil
+        autoScanProgress = 0
     }
 
     private func scanOnce() async {
@@ -226,23 +232,27 @@ final class ScannerStore: ObservableObject {
 
         isBusy = true
         isScanning = true
+        scanProgress = 0
         status = .scanning("Scanning local network...")
         refreshLocalNetwork()
 
         do {
             let foundDevices = try await scanner.scan { completed, total in
                 Task { @MainActor in
+                    self.scanProgress = total > 0 ? Double(completed) / Double(total) : 0
                     self.status = .scanning("Scanned \(completed) of \(total) addresses...")
                 }
             }
 
             mergeDevices(foundDevices)
             isScanning = false
+            scanProgress = 0
             status = .complete("Updated \(foundDevices.count) devices. \(devices.count) listed.")
             isBusy = false
         } catch {
             status = .failed(error.localizedDescription)
             isScanning = false
+            scanProgress = 0
             isBusy = false
         }
     }
@@ -273,26 +283,31 @@ final class ScannerStore: ObservableObject {
 }
 
 struct HeaderPanel: View {
-    @Environment(\.colorScheme) private var colorScheme
     let network: LocalNetwork?
     let isScanning: Bool
+    let progress: Double
+    let onScan: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .center, spacing: 12) {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack(spacing: 8) {
-                        ScannerLabel()
+                HStack(spacing: 10) {
+                    ScannerLabel()
 
-                        if isScanning {
-                            PillLabel("Scanning...")
-                        }
-                    }
-
-                    Text(network?.displayName ?? "No local IPv4 network")
-                        .font(.system(size: 22, weight: .bold))
+                    Text(network.map { "\($0.prefix).0/24" } ?? "No local IPv4 network")
+                        .font(.system(size: 17, weight: .bold))
                         .foregroundStyle(AppColors.heading)
                         .lineLimit(1)
+
+                    Button(action: onScan) {
+                        ScanProgressButtonLabel(
+                            isScanning: isScanning,
+                            progress: progress
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .allowsHitTesting(!isScanning)
+                    .help(isScanning ? "Scanning \(Int((progress * 100).rounded()))%" : "Next scan in \(max(0, 60 - Int((progress * 60).rounded()))) seconds")
                 }
 
                 Spacer()
@@ -321,15 +336,14 @@ struct HeaderPanel: View {
     }
 
     private var headerBackground: Color {
-        colorScheme == .light ? AppColors.panelBackground : AppColors.pageBackground
+        AppColors.panelBackground
     }
 }
 
 struct ScannerLabel: View {
     var body: some View {
         Text("Network")
-            .font(.system(size: 13, weight: .bold))
-            .textCase(.uppercase)
+            .font(.system(size: 14, weight: .bold))
             .foregroundStyle(AppColors.caption)
     }
 }
@@ -353,114 +367,270 @@ struct DeviceListPanel: View {
     @Binding var sortColumn: DeviceSortColumn
     @Binding var sortAscending: Bool
     @State private var selectedDeviceID: String?
-    @State private var inspectedDevice: InspectedDevice?
-    @State private var inspectingDevice: NetworkDevice?
+    @State private var inspectionCache: [String: CachedDeviceInspection] = [:]
+    @State private var inspectingDeviceIDs: Set<String> = []
+    @State private var inspectorPanelWidth = SettingsStore.loadInspectorPanelWidth()
 
     private let scanner = LANScanner()
+    private let dividerWidth: CGFloat = 10
+    private let minDeviceListWidth: CGFloat = 620
+    private let minInspectorWidth: CGFloat = 300
+    private let defaultInspectorWidth: CGFloat = 370
 
     var body: some View {
-        ZStack {
-            VStack(spacing: 0) {
-                HStack(spacing: 10) {
-                    Text("Devices")
-                        .font(.caption)
-                        .fontWeight(.bold)
-                        .textCase(.uppercase)
-                        .foregroundStyle(AppColors.caption)
+        GeometryReader { proxy in
+            let availableWidth = proxy.size.width
+            let inspectorWidth = clampedInspectorWidth(for: availableWidth)
 
-                    Spacer()
+            HStack(spacing: 0) {
+                VStack(spacing: 0) {
+                    HStack(spacing: 10) {
+                        Text("Devices")
+                            .font(.caption)
+                            .fontWeight(.bold)
+                            .textCase(.uppercase)
+                            .foregroundStyle(AppColors.caption)
 
-                    PillLabel("\(devices.count) devices", isActive: false)
-                }
-                .padding([.horizontal, .top], 16)
-                .padding(.bottom, 10)
+                        Spacer()
 
-                DeviceTableHeader(sortColumn: $sortColumn, sortAscending: $sortAscending)
-                    .padding(.trailing, DeviceTableColumns.scrollbarGutter)
+                        PillLabel("\(devices.count) devices", isActive: false)
+                    }
+                    .padding([.horizontal, .top], 16)
+                    .padding(.bottom, 10)
 
-                ScrollView {
-                    LazyVStack(spacing: 0) {
-                        ForEach(Array(devices.enumerated()), id: \.element.id) { index, device in
-                            DeviceTableRow(
-                                device: device,
-                                isSelected: selectedDeviceID == device.id,
-                                isAlternate: index.isMultiple(of: 2),
-                                onInfo: {
-                                    selectedDeviceID = device.id
-                                    inspect(device)
+                    DeviceTableHeader(sortColumn: $sortColumn, sortAscending: $sortAscending)
+                        .padding(.trailing, DeviceTableColumns.scrollbarGutter)
+
+                    ScrollView {
+                        LazyVStack(spacing: 0) {
+                            ForEach(Array(devices.enumerated()), id: \.element.id) { index, device in
+                                DeviceTableRow(
+                                    device: device,
+                                    isSelected: selectedDeviceID == device.id,
+                                    isAlternate: index.isMultiple(of: 2),
+                                    isInspected: inspectionCache[device.id] != nil
+                                )
+                                .onTapGesture {
+                                    select(device)
                                 }
-                            )
-                            .onTapGesture {
-                                selectedDeviceID = device.id
                             }
                         }
+                        .padding(.bottom, 10)
                     }
-                    .padding(.bottom, 10)
                 }
-            }
+                .frame(width: max(minDeviceListWidth, availableWidth - inspectorWidth - dividerWidth))
+                .background(AppColors.panelBackground)
+                .panelChrome()
 
-            if let inspectingDevice {
-                DeviceInspectingOverlay(device: inspectingDevice)
+                SplitDivider()
+                    .frame(width: dividerWidth)
+                    .gesture(
+                        DragGesture(minimumDistance: 0, coordinateSpace: .named("DeviceInspectorSplitView"))
+                            .onChanged { value in
+                                let width = clampedInspectorWidth(
+                                    availableWidth - value.location.x - (dividerWidth / 2),
+                                    availableWidth: availableWidth
+                                )
+                                inspectorPanelWidth = width
+                                SettingsStore.save(inspectorPanelWidth: width)
+                            }
+                    )
+
+                DeviceInspectorPanel(
+                    device: selectedDevice,
+                    cachedInspection: selectedDevice.flatMap { inspectionCache[$0.id] },
+                    isInspecting: selectedDevice.map { inspectingDeviceIDs.contains($0.id) } ?? false
+                )
+                .frame(width: inspectorWidth)
+            }
+            .coordinateSpace(name: "DeviceInspectorSplitView")
+        }
+    }
+
+    private var selectedDevice: NetworkDevice? {
+        devices.first { $0.id == selectedDeviceID }
+    }
+
+    private func select(_ device: NetworkDevice) {
+        selectedDeviceID = device.id
+
+        guard inspectionCache[device.id] == nil else {
+            return
+        }
+
+        inspect(device)
+    }
+
+    private func inspect(_ device: NetworkDevice) {
+        guard !inspectingDeviceIDs.contains(device.id) else {
+            return
+        }
+
+        inspectingDeviceIDs.insert(device.id)
+
+        Task {
+            let inspection = await scanner.inspect(device: device)
+            inspectionCache[device.id] = CachedDeviceInspection(
+                inspection: inspection
+            )
+            inspectingDeviceIDs.remove(device.id)
+        }
+    }
+
+    private func clampedInspectorWidth(for availableWidth: CGFloat) -> CGFloat {
+        clampedInspectorWidth(inspectorPanelWidth ?? defaultInspectorWidth, availableWidth: availableWidth)
+    }
+
+    private func clampedInspectorWidth(_ width: CGFloat, availableWidth: CGFloat) -> CGFloat {
+        let maxInspectorWidth = max(minInspectorWidth, availableWidth - dividerWidth - minDeviceListWidth)
+        return min(max(width, minInspectorWidth), maxInspectorWidth)
+    }
+}
+
+struct CachedDeviceInspection {
+    let inspection: DeviceInspection
+}
+
+struct SplitDivider: View {
+    var body: some View {
+        ZStack {
+            Rectangle()
+                .fill(Color.clear)
+
+            Capsule()
+                .fill(AppColors.fieldBorder)
+                .frame(width: 4)
+        }
+        .contentShape(Rectangle())
+        .onHover { isHovering in
+            if isHovering {
+                NSCursor.resizeLeftRight.set()
+            } else {
+                NSCursor.arrow.set()
+            }
+        }
+    }
+}
+
+struct DeviceInspectorPanel: View {
+    let device: NetworkDevice?
+    let cachedInspection: CachedDeviceInspection?
+    let isInspecting: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            inspectorHeader
+
+            if let device {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 16) {
+                        DeviceInspectorSummary(device: device)
+
+                        if let cachedInspection {
+                            DeviceInspectionContent(inspection: cachedInspection.inspection)
+                        } else if isInspecting {
+                            DeviceInspectingMessage()
+                        } else {
+                            DeviceInspectionMessage(
+                                text: "Waiting to inspect this device…",
+                                systemImage: "magnifyingglass"
+                            )
+                        }
+                    }
+                    .padding(16)
+                }
+
+            } else {
+                VStack(spacing: 10) {
+                    Image(systemName: "sidebar.right")
+                        .font(.system(size: 25, weight: .semibold))
+                        .foregroundStyle(AppColors.primaryStrong)
+                    Text("Select a device")
+                        .font(.system(size: 15, weight: .bold))
+                        .foregroundStyle(AppColors.heading)
+                    Text("Choose a row to view details and inspect the device.")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(AppColors.badgeText)
+                        .multilineTextAlignment(.center)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding(24)
             }
         }
         .background(AppColors.panelBackground)
         .panelChrome()
-        .sheet(item: $inspectedDevice) { inspectedDevice in
-            DeviceInfoDialog(device: inspectedDevice.device, inspection: inspectedDevice.inspection)
-        }
     }
 
-    private func inspect(_ device: NetworkDevice) {
-        guard inspectingDevice == nil else {
-            return
+    private var inspectorHeader: some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 4) {
+                if let device {
+                    Text(device.displayName)
+                        .font(.system(size: 15, weight: .bold))
+                        .foregroundStyle(AppColors.heading)
+                        .lineLimit(1)
+
+                    HStack(spacing: 12) {
+                        Label(DateFormatter.scannerTime.string(from: device.lastSeen), systemImage: "clock")
+                        Label(device.pingText, systemImage: "speedometer")
+                    }
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(AppColors.badgeText)
+                }
+            }
+            Spacer()
         }
-
-        inspectingDevice = device
-
-        Task {
-            let inspection = await scanner.inspect(device: device)
-            inspectingDevice = nil
-            inspectedDevice = InspectedDevice(device: device, inspection: inspection)
+        .padding(.horizontal, 16)
+        .frame(minHeight: 58)
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(AppColors.panelBorder)
+                .frame(height: 1)
         }
     }
 
 }
 
-struct InspectedDevice: Identifiable {
-    let device: NetworkDevice
-    let inspection: DeviceInspection
-
-    var id: String { device.id }
-}
-
-struct DeviceInspectingOverlay: View {
+struct DeviceInspectorSummary: View {
     let device: NetworkDevice
 
     var body: some View {
-        VStack(spacing: 10) {
-            ProgressView()
-                .scaleEffect(0.8)
-
-            Text("Inspecting device...")
-                .font(.system(size: 14, weight: .bold))
-                .foregroundStyle(AppColors.heading)
-
-            Text(device.displayName)
-                .font(.system(size: 12, weight: .semibold, design: .monospaced))
-                .foregroundStyle(AppColors.badgeText)
-                .lineLimit(1)
-                .truncationMode(.middle)
+        VStack(spacing: 0) {
+            summaryRow("Address", value: device.ipAddress, systemImage: "network")
+            summaryRow("MAC address", value: device.macAddress ?? "Unknown", systemImage: "number")
+            summaryRow("Vendor", value: device.vendor ?? "Unknown", systemImage: "building.2")
+            summaryRow("Ping", value: device.pingText, systemImage: "speedometer")
         }
-        .padding(.horizontal, 22)
-        .padding(.vertical, 18)
-        .frame(width: 250)
-        .background(AppColors.panelBackground)
         .clipShape(RoundedRectangle(cornerRadius: 8))
         .overlay {
             RoundedRectangle(cornerRadius: 8)
                 .stroke(AppColors.panelBorder, lineWidth: 1)
         }
-        .shadow(radius: 14)
+    }
+
+    private func summaryRow(_ title: String, value: String, systemImage: String) -> some View {
+        HStack(spacing: 9) {
+            Image(systemName: systemImage)
+                .foregroundStyle(AppColors.primaryStrong)
+                .frame(width: 17)
+            Text(title)
+                .font(.system(size: 12, weight: .bold))
+                .foregroundStyle(AppColors.heading)
+            Spacer()
+            Text(value)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(AppColors.badgeText)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+        .padding(.horizontal, 11)
+        .frame(minHeight: 36)
+        .background(AppColors.tableRowBackground)
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(AppColors.panelBorder)
+                .frame(height: 1)
+        }
     }
 }
 
@@ -478,8 +648,6 @@ struct DeviceTableHeader: View {
                 .frame(minWidth: DeviceTableColumns.vendorMinWidth, maxWidth: .infinity, alignment: .leading)
             DeviceHeaderCell(column: .ping, sortColumn: $sortColumn, sortAscending: $sortAscending)
                 .frame(width: DeviceTableColumns.pingWidth, alignment: .leading)
-            DeviceHeaderCell(column: .lastSeen, sortColumn: $sortColumn, sortAscending: $sortAscending)
-                .frame(width: DeviceTableColumns.seenWidth, alignment: .leading)
         }
         .padding(.horizontal, 12)
         .padding(.top, 2)
@@ -495,11 +663,10 @@ struct DeviceTableHeader: View {
 
 enum DeviceTableColumns {
     static let scrollbarGutter: CGFloat = 16
-    static let nameMinWidth: CGFloat = 250
-    static let addressWidth: CGFloat = 350
-    static let vendorMinWidth: CGFloat = 220
-    static let pingWidth: CGFloat = 90
-    static let seenWidth: CGFloat = 96
+    static let nameMinWidth: CGFloat = 150
+    static let addressWidth: CGFloat = 190
+    static let vendorMinWidth: CGFloat = 110
+    static let pingWidth: CGFloat = 70
 }
 
 struct DeviceHeaderCell: View {
@@ -563,20 +730,16 @@ struct DeviceTableRow: View {
     let device: NetworkDevice
     let isSelected: Bool
     let isAlternate: Bool
-    let onInfo: () -> Void
+    let isInspected: Bool
 
     var body: some View {
         HStack(spacing: 6) {
             DeviceTableCell(isPrimary: true) {
-                HStack(spacing: 9) {
-                    Button(action: onInfo) {
-                        Image(systemName: "info.circle")
-                            .font(.system(size: 14, weight: .semibold))
-                            .foregroundStyle(AppColors.badgeText)
-                            .frame(width: 18, height: 20)
-                            .contentShape(Circle())
-                    }
-                    .buttonStyle(.plain)
+                HStack(spacing: 8) {
+                    Image(systemName: isInspected ? "circle.fill" : "circle")
+                        .font(.system(size: 8, weight: .bold))
+                        .foregroundStyle(isInspected ? AppColors.primaryStrong : AppColors.treeDisclosure)
+                        .frame(width: 10)
 
                     Text(device.displayName)
                         .lineLimit(1)
@@ -584,14 +747,12 @@ struct DeviceTableRow: View {
             }
             .frame(minWidth: DeviceTableColumns.nameMinWidth, maxWidth: .infinity, alignment: .leading)
 
-            DeviceTableCell(isMonospaced: true) { Text(device.addressText) }
+            DeviceTableCell(isMonospaced: true) { Text(device.ipAddress) }
                 .frame(width: DeviceTableColumns.addressWidth, alignment: .leading)
             DeviceTableCell { Text(device.vendor ?? "-") }
                 .frame(minWidth: DeviceTableColumns.vendorMinWidth, maxWidth: .infinity, alignment: .leading)
             DeviceTableCell(isMonospaced: true) { Text(device.pingText) }
                 .frame(width: DeviceTableColumns.pingWidth, alignment: .leading)
-            DeviceTableCell(isMonospaced: true) { Text(DateFormatter.scannerTime.string(from: device.lastSeen)) }
-                .frame(width: DeviceTableColumns.seenWidth, alignment: .leading)
         }
         .padding(.horizontal, 12)
         .frame(height: 34)
@@ -628,62 +789,10 @@ struct DeviceTableCell<Content: View>: View {
     }
 }
 
-struct DeviceInfoDialog: View {
-    @Environment(\.dismiss) private var dismiss
-    let device: NetworkDevice
+struct DeviceInspectionContent: View {
     let inspection: DeviceInspection
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            HStack(spacing: 10) {
-                Image(systemName: "info.circle.fill")
-                    .font(.system(size: 24, weight: .semibold))
-                    .foregroundStyle(AppColors.primaryStrong)
-
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("Device Inspection")
-                        .font(.system(size: 20, weight: .bold))
-                        .foregroundStyle(AppColors.heading)
-                    Text(device.displayName)
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(AppColors.badgeText)
-                }
-
-                Spacer()
-            }
-
-            VStack(alignment: .leading, spacing: 10) {
-                HStack(spacing: 8) {
-                    Text("Findings")
-                        .font(.caption)
-                        .fontWeight(.bold)
-                        .textCase(.uppercase)
-                        .foregroundStyle(AppColors.caption)
-
-                    Spacer()
-                }
-
-                ScrollView {
-                    inspectionContent
-                }
-                .frame(maxHeight: 420)
-            }
-
-            HStack {
-                Spacer()
-                Button("Close") {
-                    dismiss()
-                }
-                .keyboardShortcut(.defaultAction)
-            }
-        }
-        .padding(22)
-        .frame(width: 520, height: 560)
-        .background(AppColors.panelBackground)
-    }
-
-    @ViewBuilder
-    private var inspectionContent: some View {
         if inspection.hasFindings {
             VStack(spacing: 0) {
                 ForEach(inspection.likelyTypes, id: \.self) { type in
@@ -702,11 +811,12 @@ struct DeviceInfoDialog: View {
                     )
                 }
 
-                ForEach(inspection.systemFindings) { finding in
+                ForEach(inspection.systemFindings.filter { !Self.headerFindingNames.contains($0.name) }) { finding in
                     DeviceInspectionResultRow(
                         title: finding.name,
                         detail: finding.detail,
-                        systemImage: finding.systemImage
+                        systemImage: finding.systemImage,
+                        progress: finding.progress
                     )
                 }
 
@@ -727,6 +837,8 @@ struct DeviceInfoDialog: View {
             DeviceInspectionMessage(text: "No open known services found. Only local device data is available.", systemImage: "checkmark.circle")
         }
     }
+
+    private static let headerFindingNames: Set<String> = ["Last seen", "Ping response"]
 }
 
 struct ThemeSettingsDialog: View {
@@ -877,10 +989,38 @@ struct DeviceInspectionMessage: View {
     }
 }
 
+struct DeviceInspectingMessage: View {
+    @State private var isRotating = false
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "arrow.triangle.2.circlepath")
+                .rotationEffect(.degrees(isRotating ? 360 : 0))
+                .animation(.linear(duration: 0.9).repeatForever(autoreverses: false), value: isRotating)
+
+            Text("Inspecting device...")
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .font(.system(size: 13, weight: .semibold))
+        .foregroundStyle(AppColors.badgeText)
+        .padding(12)
+        .background(AppColors.tableRowBackground)
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(AppColors.panelBorder, lineWidth: 1)
+        }
+        .onAppear {
+            isRotating = true
+        }
+    }
+}
+
 struct DeviceInspectionResultRow: View {
     let title: String
     let detail: String
     let systemImage: String
+    var progress: Double? = nil
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
@@ -897,6 +1037,13 @@ struct DeviceInspectionResultRow: View {
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(AppColors.badgeText)
                     .textSelection(.enabled)
+
+                if let progress {
+                    ProgressView(value: progress)
+                        .progressViewStyle(.linear)
+                        .tint(AppColors.primaryStrong)
+                        .padding(.top, 4)
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -1020,6 +1167,47 @@ struct PillLabel: View {
                     .stroke(isActive ? AppColors.primary.opacity(0.65) : AppColors.fieldBorder, lineWidth: 1)
             }
             .contentShape(Capsule())
+    }
+}
+
+struct ScanProgressButtonLabel: View {
+    let isScanning: Bool
+    let progress: Double
+    @State private var isRotating = false
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .stroke(AppColors.primary.opacity(0.45), lineWidth: 1.5)
+
+            Circle()
+                .trim(from: 0, to: min(max(progress, 0), 1))
+                .stroke(
+                    AppColors.primaryStrong,
+                    style: StrokeStyle(lineWidth: 2.5, lineCap: .round)
+                )
+                .rotationEffect(.degrees(-90))
+                .animation(.easeOut(duration: 0.2), value: progress)
+
+            Image(systemName: "arrow.triangle.2.circlepath")
+                .font(.system(size: 14, weight: .bold))
+                .rotationEffect(.degrees(isRotating ? 360 : 0))
+                .animation(
+                    isScanning ? .linear(duration: 0.9).repeatForever(autoreverses: false) : .default,
+                    value: isRotating
+                )
+        }
+        .frame(width: 36, height: 36)
+        .foregroundStyle(AppColors.primaryStrong)
+        .contentShape(Circle())
+        .accessibilityLabel(isScanning ? "Scanning network" : "Scan network")
+        .accessibilityValue(isScanning ? "\(Int((progress * 100).rounded())) percent" : "Next scan in \(max(0, 60 - Int((progress * 60).rounded()))) seconds")
+        .onAppear {
+            isRotating = isScanning
+        }
+        .onChange(of: isScanning) { _, scanning in
+            isRotating = scanning
+        }
     }
 }
 
@@ -1180,4 +1368,5 @@ extension DateFormatter {
         formatter.dateFormat = "HH:mm:ss"
         return formatter
     }()
+
 }

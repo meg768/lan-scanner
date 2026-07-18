@@ -105,6 +105,15 @@ struct DeviceInspectionItem: Identifiable, Hashable {
     let detail: String
     let port: Int?
     let systemImage: String
+    let progress: Double?
+
+    init(name: String, detail: String, port: Int?, systemImage: String, progress: Double? = nil) {
+        self.name = name
+        self.detail = detail
+        self.port = port
+        self.systemImage = systemImage
+        self.progress = progress
+    }
 
     var id: String {
         if let port {

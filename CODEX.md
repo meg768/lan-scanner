@@ -44,6 +44,12 @@ When checked on 2026-06-30, `security find-identity -v -p codesigning` returned 
 
 ## Visual Design
 
+### 2026-07-18
+
+- Den automatiska scanningen körs nu 60 sekunder efter att föregående scan avslutats, i stället för efter 120 sekunder. Den kombinerade Scan-kontrollen fylls under väntetiden som en sann nedräkningsprogress; när scanningen startar växlar samma ring till faktisk adressprogress och pilen roterar. Hover och accessibility visar återstående sekunder när appen väntar.
+
+- Scan-pillens text och separata spinner har ersatts av en kompakt 36 × 36 px Scan-kontroll, inspirerad av Vitels kombinerade progress-/uppdateringsknapp. Den fasta cirkeln är knappens ram, den inre progresslinjen visar verkligt antal färdigtestade adresser av 254 och pilen roterar endast medan scanningen pågår. När kontrollen är ledig startar ett klick en ny scan; hjälptext och accessibility-värde visar funktion respektive procent.
+
 `LAN Scanner` and `/Users/magnus/Documents/GitHub/broker-explorer` are sister
 tools. Keep their `hard`, `grass`, and `clay` themes visually synchronized:
 same RGB palette, same 8px panel radius, same panel border treatment, and the
